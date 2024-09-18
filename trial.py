@@ -1,559 +1,438 @@
-from psychopy import core, visual, gui, data, event
+"""Utilities for defining experimental trials for eyetracking experiment."""
+
+import random
+import time
+
 import numpy as np
-import logging
-import json
-from eyetracking import height2pix
-from util import jsonify
+# NOTE: These packages are lazily imported
+from psychopy import core, visual, event
 
-wait = core.wait
+import config
+import eyetracking
 
-COLOR_PLAN = '#F2384A'
-COLOR_ACT = '#126DEF'
 
-from graphics import Graphics, FRAME_RATE
-
-def reward_string(r):
-    return f'{int(r):+}' if r else ''
-
-def distance(p1, p2):
-    (x1, y1), (x2, y2) = (p1, p2)
-    return np.sqrt((x1 - x2)**2 + (y1 - y2)**2)
-
-class GraphTrial(object):
-    """Graph navigation interface"""
-    def __init__(self, win, graph, rewards, start, layout, plan_time=None, act_time=None, start_mode=None,
-                 highlight_edges=False, stop_on_x=False, hide_rewards_while_acting=True, initial_stage='planning',
-                 eyelink=None, gaze_contingent=False, gaze_tolerance=1.2, fixation_lag = .5, show_gaze=False,
-                 pos=(0, 0), space_start=True, max_score=None, **kws):
-        self.win = win
-        self.graph = graph
-        self.rewards = list(rewards)
-        self.start = start
-        self.layout = layout
-        self.plan_time = plan_time
-        self.act_time = act_time
-        if start_mode is None:
-            start_mode = 'drift_check' if eyelink else 'space'
-        self.start_mode = start_mode
-        self.highlight_edges = highlight_edges
-        self.stop_on_x = stop_on_x
-        self.hide_rewards_while_acting = hide_rewards_while_acting
-
+class VideoTrial:
+    '''Class for playing videos and collecting eye tracking data real time.
+    
+    Args:
+        eyelink: The pylink.EyeLink object (tracker).
+        video_path: The path to the video to be played.
+        win: Psychopy window object.
+    '''
+    def __init__(
+            self,
+            eyelink:eyetracking.EyeLink | eyetracking.MouseLink,
+            video_path:str,
+            win:visual.Window,
+            id:int):
         self.eyelink = eyelink
-        self.gaze_contingent = gaze_contingent
-        self.gaze_tolerance = gaze_tolerance
-        self.fixation_lag = fixation_lag
-        self.show_gaze = show_gaze
-        self.last_gaze = None
+        self.gaze_data = []
+        self.video_start_time = None
+        self._video_is_playing = True
+        self._last_frame = None
+        self.win = win
+        self.id = id
+        self.scene_name = video_path.split('/')[-1].split('.')[0]
+        self.video_path = video_path
+        width = 800*.98
+        height = 1000*.98
+        # Create the video stimulus with the new size
+        self.video = visual.MovieStim(
+            win=self.win,
+            filename=video_path,
+            size=(width, height),
+            pos=(0, 0),  # Center the video
+            noAudio=True
+        )
 
-        self.pos = pos
-        self.space_start = space_start
-        self.max_score = max_score
-
-        # all for current stage
-        self.stage = initial_stage
-        self.current_time = None
-        self.start_time = None
-        self.end_time = None
-
-        self.status = 'ok'
-        self.disable_click = False
-        self.score = 0
-        self.current_state = None
-        self.fixated = None
-        self.fix_verified = None
-        self.data = {
-            "trial": {
-                "kind": self.__class__.__name__,
-                "graph": graph,
-                "rewards": rewards,
-                "start": start,
-                "plan_time": plan_time,
-                "act_time": act_time,
-                "gaze_contingent": gaze_contingent,
-                "gaze_tolerance": gaze_tolerance,
-                "fixation_lag": fixation_lag
-            },
-            "events": [],
-            "flips": [],
-            "mouse": [],
-        }
-        logging.info("begin trial " + jsonify(self.data["trial"]))
-        self.gfx = Graphics(win)
-        self.mouse = event.Mouse()
-        self.done = False
-
-
-    def log(self, event, info={}):
-        time = core.getTime()
-        logging.debug(f'{self.__class__.__name__}.log {time:3.3f} {event} ' + ', '.join(f'{k} = {v}' for k, v in info.items()))
-        datum = {
-            'time': time,
-            'event': event,
-            **info
-        }
-        self.data["events"].append(datum)
-        if self.eyelink:
-            self.eyelink.message(jsonify(datum), log=False)
-
-
-    def show(self):
-        # self.win.clearAutoDraw()
-        if hasattr(self, 'nodes'):
-            self.gfx.show()
-            if self.gaze_contingent:
-                self.update_fixation()
-            return
-
-        self.nodes = nodes = []
-        for i, (x, y) in enumerate(self.layout):
-            nodes.append(self.gfx.circle(0.7 * np.array([x, y]), name=f'node{i}', r=.04))
-        self.data["trial"]["node_positions"] = [height2pix(self.win, n.pos) for n in self.nodes]
-
-        self.reward_labels = [self.gfx.text('', n.pos, height=.04, name=f'lab{i}') for i, n in enumerate(self.nodes)]
-        self.update_node_labels()
-
-        self.arrows = {}
-        for i, js in enumerate(self.graph):
-            for j in js:
-                self.arrows[(i, j)] = self.gfx.arrow(nodes[i], nodes[j])
-
-
-        if self.plan_time is not None or self.act_time is not None:
-            self.timer_wrap = self.gfx.rect((0.5,-0.45), .02, 0.9, anchor='bottom', color=-.1)
-            self.timer = self.gfx.rect((0.5,-0.45), .02, 0.9, anchor='bottom', color=-.2)
-        else:
-            self.timer = None
-
-        self.mask = self.gfx.rect((.1,0), 1.1, 1, color='gray', opacity=0)
-        self.gfx.shift(*self.pos)
-
-        if self.show_gaze:
-            self.gaze_dot = self.gfx.circle((0,0), .005, color='red', lineWidth=1, lineColor="red")
-
-    def hide(self):
-        self.gfx.clear()
-
-    def shift(self, x, y):
-        self.gfx.shift(x, y)
-        self.pos = np.array(self.pos) + [x, y]
-
-
-    def set_reward(self, s, r):
-        self.rewards[s] = r
-        self.reward_labels[s].text = reward_string(r)
-
-    def get_click(self):
-        if self.mouse.getPressed()[0]:
-            pos = self.mouse.getPos()
-            for (i, n) in enumerate(self.nodes):
-                if n.contains(pos):
-                    return i
-
-    def set_state(self, s):
-        self.log('visit', {'state': s})
-        self.nodes[s].fillColor = COLOR_PLAN if self.stage == 'planning' else COLOR_ACT
-        lab = self.reward_labels[s]
-        self.score += self.rewards[s]
-        prev = self.current_state
-
-        self.set_node_label(s, reward_string(self.rewards[s]))
-
-        self.current_state = s
-        if len(self.graph[self.current_state]) == 0:
-            self.done = True
-
-        if prev is not None and prev != s:  # not initial
-            self.nodes[prev].fillColor = 'white'
-            lab.color = 'white'
-            # lab.bold = True
-            for p in self.gfx.animate(6/60):
-                lab.setHeight(0.04 + p * 0.02)
-                self.tick()
-            for p in self.gfx.animate(12/60):
-                lab.setHeight(0.06 - p * 0.05)
-                lab.setOpacity(1-p)
-                self.tick()
-
-        lab.setText('')
-
-    def click(self, s):
-        if s in self.graph[self.current_state]:
-            self.set_state(s)
-
-    def is_done(self):
-        return len(self.graph[self.current_state]) == 0
-
-    def fade_out(self):
-        for p in self.gfx.animate(.2):
-            self.mask.setOpacity(p)
+    def play_video(self) -> None:
+        '''Method for playing video stimulus to participant frame by frame.'''
+        self.video_start_time = time.time()
+        # Send video stimulus onset message
+        self.eyelink.message('VIDEO_STIM_ONSET')
+        # Play the video stimulus
+        self.video.play()
+        event.clearEvents()
+        frame_count = 0
+        while self.video.status != visual.FINISHED:
+            # NOTE: Make sure this works
+            # Send data viewer video frame message
+            self.eyelink.message('!V VRAME %d %d %d %s' % (
+                frame_count,
+                self.win.size[0]/2-self.video.size[0]/2,
+                self.win.size[1]/2-self.video.size[1]/2,
+                self.video_path
+            ))
+            # Draw video frame
+            self.video.draw()
             self.win.flip()
-        self.gfx.clear()
-        self.win.flip()
-        wait(.3)
+            self.update_gaze()
+            keys = event.getKeys(['f','j'])
+            if 'j' in keys or 'f' in keys:
+                self.eyelink.message('BUTTON_PRESS')
+                return keys  # Move to next trial
+            if config.EXIT_KEY in keys:
+                self.eyelink.message('BUTTON_PRESS')
+                return False # Exit experiment
+            frame_count += 1
+        # Video has finished, show last frame indefinitely until response
+        event.clearEvents()
+        while True:
+            self.video.draw()  # This will draw the last frame
+            self.win.flip()
+            self.update_gaze()
+            keys = event.getKeys(['f','j'])
+            if 'j' in keys or 'f' in keys:
+                self.eyelink.message('BUTTON_PRESS')
+                return keys  # Move to next trial
+            if config.EXIT_KEY in keys:
+                self.eyelink.message('BUTTON_PRESS')
+                return False # Exit experiment
 
-    def node_label(self, i):
-        if self.gaze_contingent:
-            if i == self.fixated:
-                return reward_string(self.rewards[i])
-            elif self.rewards[i]:
-                return '?'
-            else:
-                return ''
-        else:
-            return reward_string(self.rewards[i])
+    def start_video_and_tracking(self) -> None:
+        '''Method for initiating video playback and eye tracker.'''
+        self.eyelink.start_recording()
+        self.play_video()
 
-    def update_node_labels(self):
-        for i in range(len(self.nodes)):
-            self.set_node_label(i, self.node_label(i))
-        logging.debug('update_node_labels %s', [lab.text for lab in self.reward_labels])
-
-    def set_node_label(self, i, new):
-        old = self.reward_labels[i].text
-        if old != new:
-            logging.debug(f'Changing reward_label[%s] from %s to %s', i, old, new)
-            self.reward_labels[i].text = new
-
-
-    def update_fixation(self):
+    def update_gaze(self) -> None:
+        """Samples current gaze position and records it in pixels."""
         if not self.eyelink:
             return
-        gaze = self.eyelink.gaze_position()
+        current_time = time.time() - self.video_start_time
+        gaze_sample = self.eyelink.gaze_position()
+        # Convert gaze coordinates to PsychoPy coordinates
+        # Return gaze data in pixel values
+        gaze_x = gaze_sample[0]
+        gaze_y = gaze_sample[1]
+        if self.eyelink.win.units == 'height':
+            gaze_x, gaze_y = eyetracking.height2pix(
+                self.eyelink.win, (gaze_x, gaze_y))
+        # Store gaze data with timestamp
+        self.gaze_data.append((current_time, gaze_x, gaze_y))
 
-        if self.last_gaze is not None:
-            gaze_distance = distance(gaze, self.last_gaze)
-        self.last_gaze = gaze
-
-        if self.show_gaze:
-            self.gaze_dot.setPos(gaze)
-        self.last_fixated = self.fixated
-
-        for i in range(len(self.nodes)):
-            if distance(gaze, self.nodes[i].pos) < self.gaze_tolerance * self.nodes[i].radius:
-
-
-                if self.fixated != i:
-                    self.log('fixate state', {'state': i})
-                self.fixated = i
-                self.fix_verified = core.getTime()
-                break
-
-        if self.fixated is not None and core.getTime() - self.fix_verified > self.fixation_lag:
-            self.log('unfixate state', {'state': self.fixated})
-            self.fixated = None
-
-        if self.gaze_contingent and self.last_fixated != self.fixated:
-            self.update_node_labels()
-
-    def check_click(self):
-        if self.disable_click:
-            return
-        clicked = self.get_click()
-        if clicked is not None and clicked in self.graph[self.current_state]:
-            self.set_state(clicked)
-            return True
-
-    def highlight_current_edges(self):
-        for (i, j), arrow in self.arrows.items():
-            if i == self.current_state:
-                arrow.setColor('#FFC910')
-                arrow.objects[0].setDepth(1)  # make sure the line is on top
-                self.nodes[j].setLineColor('#FFC910')
-            else:
-                arrow.setColor('black')
-                arrow.objects[0].setDepth(2)
-                self.nodes[j].setLineColor('black')
-
-    def tick(self):
-        self.current_time = core.getTime()
-        if self.end_time is not None: # TODO
-            time_left = self.end_time - self.current_time
-            if time_left > 0:
-                p = time_left / (self.end_time - self.start_time)
-                self.timer.setHeight(0.9 * p)
-                if self.stage == 'acting' and time_left < 3:
-                    p2 = time_left / 3
-                    original = -.2 * np.ones(3)
-                    red = np.array([1, -1, -1])
-                    self.timer.setColor(p2 * original + (1-p2) * red)
-        self.last_flip = t = self.win.flip()
-        self.data["mouse"].append(self.mouse.getPos())
-        self.data["flips"].append(t)
-        return t
-
-    def do_timeout(self):
-        self.log('timeout')
-        logging.info('timeout')
-        for i in range(3):
-            self.timer_wrap.setColor('red'); self.win.flip()
-            wait(0.3)
-            self.timer_wrap.setColor(-.2); self.win.flip()
-            wait(0.3)
-
-        # random choices
-        while not self.done:
-            self.set_state(np.random.choice(self.graph[self.current_state]))
-            core.wait(.5)
-
-    def start_recording(self):
-        self.log('start recording')
-        self.eyelink.start_recording()
-
-        # TODO: draw reference
-        # left = int(scn_width/2.0) - 60
-        # top = int(scn_height/2.0) - 60
-        # right = int(scn_width/2.0) + 60
-        # bottom = int(scn_height/2.0) + 60
-        # draw_cmd = 'draw_filled_box %d %d %d %d 1' % (left, top, right, bottom)
-        # el_tracker.sendCommand(draw_cmd)
-
-
-    def run_planning(self):
-        self.log('start planning')
-        self.stage = 'planning'
-        self.nodes[self.current_state].fillColor = COLOR_PLAN
-        self.start_time = self.current_time = core.getTime()
-        self.end_time = None if self.plan_time is None else self.start_time + self.plan_time
-
-        while not self.done:
-            if self.end_time is not None and self.current_time > self.end_time:
-                self.log('timeout planning')
-                self.done = True
-                break
-
-            self.update_fixation()
-            keys = event.getKeys()
-
-            clicked = self.get_click()
-            if clicked == self.current_state:
-                self.log('end planning')
-                break
-            elif 'x' in keys or 'c' in keys:
-                logging.warning('press x')
-                self.log('press x')
-                self.status = 'recalibrate'
-                if self.stop_on_x:
-                    self.done = True
-                    break
-            elif 'a' in keys:
-                logging.warning('press a')
-                self.log('press a')
-                self.status = 'abort'
-            self.tick()
-
-        self.fixated = None
-        self.win.flip()
-
-    def hide_rewards(self):
-        for i in range(len(self.nodes)):
-            self.set_node_label(i, '')
-
-    def run_acting(self, one_step):
-        self.nodes[self.current_state].fillColor = COLOR_ACT
-        self.log('start acting')
-        if self.hide_rewards_while_acting:
-            self.hide_rewards()
-        self.stage = 'acting'
-        self.start_time = self.current_time = core.getTime()
-        self.end_time = None if self.act_time is None else self.start_time + self.act_time
-
-        while not self.done:
-            moved = self.check_click()
-            if moved and one_step:
-                return
-            if self.highlight_edges:
-                self.highlight_current_edges()
-            if not self.done and self.end_time is not None and self.current_time > self.end_time:
-                self.do_timeout()
-            self.tick()
-
-
-
-    def run(self, one_step=False, skip_planning=False):
-        if self.start_mode == 'drift_check':
-            self.log('begin drift_check')
-            self.status = self.eyelink.drift_check(self.pos)
-        elif self.start_mode == 'fixation':
-            self.log('begin fixation')
-            self.status = self.eyelink.fake_drift_check(self.pos)
-        elif self.start_mode == 'space':
-            self.log('begin space')
-            visual.TextStim(self.win, 'press space to start', pos=self.pos, color='white', height=.035).draw()
-            self.win.flip()
-            event.waitKeys(keyList=['space'])
-
-        self.log('initialize status', {'status': self.status})
-
-        if self.status in ('abort', 'recalibrate'):
-            self.log('done', {"status": self.status})
-            return self.status
-
-        if self.eyelink:
-            self.start_recording()
-
-        self.show()
-
-        if self.current_state is None:
-            self.set_state(self.start)
-
-        self.start_time = self.tick()
-        self.log('start', {'flip_time': self.start_time})
-
-        if not (one_step or skip_planning):
-            self.run_planning()
-
-        if not self.done:
-            self.run_acting(one_step)
-            if one_step:
-                return
-
-        self.log('done')
-        logging.info("end trial " + jsonify(self.data["events"]))
-        if self.eyelink:
-            self.eyelink.stop_recording()
-        wait(.3)
-        self.fade_out()
-        return self.status
-
-
-
-
-class CalibrationTrial(GraphTrial):
-    """docstring for CalibrationTrial"""
-    all_failures = np.zeros(11)  # across separate runs ASSUME graph doesn't change
-
-    def __init__(self, *args, saccade_time=.7, n_success=2, n_fail=3, target_delay=.3 , **kwargs):
-        kwargs['gaze_contingent'] = True
-        kwargs['fixation_lag'] = .1
-        kwargs['end_time'] = None
-
-        self.saccade_time = saccade_time
-        self.n_success = n_success
-        self.n_fail = n_fail
-        self.target_delay = target_delay
-
-        self.target = None
-        self.last_target = None
-        self.arrow = None
-        self.result = None
-
-        super().__init__(*args, **kwargs)
-
-    def node_label(self, i):
-        return {
-            # self.completed: ''
-            # self.fixated: '',
-            self.target: 'O',
-        }.get(i, '')
-
-    def do_timeout(self):
-        self.log('timeout')
-        logging.info('timeout')
-        self.result = 'timeout'
-
-    def draw_arrow(self):
-        if self.arrow is not None:
-            self.arrow.setAutoDraw(False)
-        if self.last_target is not None:
-            self.arrow = self.gfx.arrow(self.nodes[self.last_target], self.nodes[self.target])
-
-    def new_target(self):
-        initial = self.target is None
-        self.last_target = self.target
-
-        if initial:
-            self.target = np.random.choice(len(self.successes))
-        else:
-            p = np.exp(
-                -5 * self.successes +
-                self.all_failures[:len(self.successes)]
-            )
-            p[self.target] = 0
-            p /= (sum(p) or 1)  # prevent divide by 0
-            self.target = np.random.choice(len(p), p=p)
-
-        self.target_time = 'flip'  # updated to be next flip time
-        self.draw_arrow()
-        self.update_node_labels()
-        self.log('new target', {"state": self.target})
-
-    def tick(self):
-        t = super().tick()
-        if self.target_time == 'flip':
-            self.target_time = t
-
-    def run(self, timeout=15):
-        assert self.eyelink
-        # self.eyelink.drift_check(self.pos)
-        self.start_recording()
-        self.show()
-        self.successes = np.zeros(len(self.nodes))
-        self.failures = np.zeros(len(self.nodes))
-        self.uncomplete = set(range(len(self.nodes)))
-        self.new_target()
-        self.start_time = self.tick()
-        self.log('start', {'flip_time': self.start_time})
-
-        self.win.mouseVisible = False
-
-        self.target_time += 5  # extra time for first fixation
-        while self.result is None:
-            self.update_fixation()
-            if 'x' in event.getKeys():  # cancel key
-                self.log('cancel')
-                self.result = 'cancelled'
-
-            elif self.last_flip > self.target_time + self.saccade_time:  # timeout
-                self.log('timeout', {"state": self.target})
-                self.failures[self.target] += 1
-                self.all_failures[self.target] += 1
-
-                self.set_node_label(self.target, 'X')
-                lab = self.reward_labels[self.target]
-                for p in range(FRAME_RATE):
-                    lab.setOpacity(1 - (p // 10) % 2)
-                    self.tick()
-                wait(self.target_delay)
-                lab.setOpacity(1)
-
-                if sum(self.failures) == self.n_fail or self.failures[self.target] == 2:
-                    self.result = 'failure'
-                else:
-                    self.new_target()
-
-            elif self.fixated == self.target:  # fixated within time
-                self.log('fixated target', {"state": self.target})
-                self.successes[self.target] += 1
-
-                lab = self.reward_labels[self.target]
-                for p in self.gfx.animate(6/60):
-                    lab.setHeight(0.04 + p * 0.02)
-                    self.tick()
-                for p in self.gfx.animate(12/60):
-                    lab.setHeight(0.06 - p * 0.03)
-                    lab.setOpacity(1-p)
-                    self.tick()
-                wait(self.target_delay)
-                lab.setOpacity(1)
-                lab.setHeight(.03)
-
-                if self.successes[self.target] == self.n_success:
-                    self.uncomplete.remove(self.target)
-                if self.uncomplete:
-                    self.new_target()
-                else:
-                    self.result = 'success'
-
-            # if not self.done and self.end_time is not None and self.start_time + self.end_time < core.getTime():
-            #     self.do_timeout()
-
-
-            t = self.tick()
-
-        self.log('done')
+    def stop_video_and_tracking(self) -> None:
+        """Stop recording from eye tracker."""
         self.eyelink.stop_recording()
-        wait(.3)
-        self.fade_out()
-        self.win.mouseVisible = True
+        self.video.stop()
+        # Get participant response time
+        response_time = time.time() - self.video_start_time
+        # Send trial variable info
+        self.eyelink.message('!V TRIAL_VAR trial_index %d' % (self.id))
+        self.eyelink.message('!V TRIAL_VAR scene_name %s' % (
+            self.scene_name))
+        self.eyelink.message('!V TRIAL_VAR rt %f' % (response_time))
 
-        return self.result
+    def run_trial(self) -> None:
+        """Run forward the video trial."""
+        # Send trial onset message
+        self.eyelink.message('TRIAL_START')
+        self.start_video_and_tracking()
+        self.stop_video_and_tracking()
+        # Send trial offset message
+        self.eyelink.message('TRIAL_END')
+
+
+class IntroductionTrial:
+    """Class for introduction trials.
+    
+    Args:
+        win: Psychopy window object.
+        image_path: The path to the image displayed in the intro trial.
+    """
+    def __init__(
+            self,
+            win:visual.Window,
+            image_path:str='data/introduction/scene_cp_2_arrow.jpg'):
+        self.win = win
+        # Index for which intro slide the trial is on
+        self.slide_number = 0
+        # Create text stimuli
+        # pylint: disable=line-too-long
+        self.text_stims = []
+        intro_text = [
+            "In this experiment, you will see 48 short clips of scenes like the one above.",
+            "In each clip, there will be a BALL, a GOAL, and multiple SLIDES.",
+            "The BALL will always be a circle.",
+            "The GOAL will always be a rectangle.",
+            "The SLIDES might change location and size from clip to clip.",
+            "The BALL and GOAL may change colors from clip to clip.",
+            "In each clip, the BALL will turn invisible, but you are to assume it's still in the scene.",
+            "YOUR TASK:",
+            "1. Judge whether the BALL will ever reach the GOAL.",
+            "Press spacebar for further instructions."
+        ]
+        # pylint: enable=line-too-long
+        y_positions = [
+            0.025,
+            0.0,
+            -0.025,
+            -0.05,
+            -0.075,
+            -0.1,
+            -0.125,
+            -0.15,
+            -0.175,
+            -0.2]
+        y_positions = map(lambda x: x - .2, y_positions)
+        for text, y_pos in zip(intro_text, y_positions):
+            text_stim = visual.TextStim(
+                win=win,
+                text=text,
+                font='Arial',
+                pos=(0, y_pos),
+                height=0.015,
+                wrapWidth=1.5,
+                color='black',
+                alignText='center'
+            )
+            self.text_stims.append(text_stim)
+        # Create image stimulus
+        self.image_stim = visual.ImageStim(
+            win=win,
+            image=image_path,
+            pos=(0, 0.12),
+            size=(800*0.0005, 1000*0.0005)  # Adjust size as needed
+        )
+
+    def draw(self) -> None:
+        """Draws the text and image stimuli onto the window."""
+        self.image_stim.draw()
+        for text_stim in self.text_stims:
+            text_stim.draw()
+
+    def run_trial(self) -> None:
+        """Method for running the trial."""
+        event.clearEvents()
+        while True:
+            self.draw()
+            self.win.flip()
+            keys = event.getKeys(['space', 'escape'])
+            if 'space' in keys:
+                return True  # Continue with the experiment
+            if config.EXIT_KEY in keys:
+                return False  # End the experiment
+            core.wait(0.1)  # Small wait to prevent hammering the CPU
+
+
+class KeyboardIntroductionTrial:
+    """Class for keyboard introduction trials.
+    
+    These trials display the controls to the participant.
+    
+    Args:
+        win: psychopy window object.
+        yes_key: The assigned key for the 'yes' response in the experiment.
+        no_key: The assigned key for the 'no' response in the experiment.
+    """
+    def __init__(self, win:visual.Window, yes_key:str, no_key:str):
+        self.win = win
+        image_path=f'data/introduction/keyboard_{yes_key}.jpeg'
+        # Create text stimuli
+        # pylint: disable=line-too-long
+        # NOTE: Put this in config
+        timeout = 5000
+        self.text_stims = []
+        intro_text = [
+            f"If the Ball WILL reach the Goal: press the letter `{yes_key}` on your keyboard.",
+            f"If the Ball WON'T reach the Goal: press the letter `{no_key}` on your keyboard",
+            f"Each clip will only be available for `{timeout/1000}` seconds",
+            "Please answer as fast and as accurately as possible!",
+            "You do not have to wait for the clip to finish to answer!",
+            "Press spacebar to continue."
+        ]
+        # pylint: enable=line-too-long
+        y_positions = [
+            0.025,
+            0.0,
+            -0.025,
+            -0.05,
+            -0.075,
+            -0.1,]
+        y_positions = map(lambda x: x - .1, y_positions)
+        for text, y_pos in zip(intro_text, y_positions):
+            text_stim = visual.TextStim(
+                win=win,
+                text=text,
+                font='Arial',
+                pos=(0, y_pos),
+                height=0.015,
+                wrapWidth=1.5,
+                color='black',
+                alignText='center'
+            )
+            self.text_stims.append(text_stim)
+        # Create image stimulus
+        self.image_stim = visual.ImageStim(
+            win=win,
+            image=image_path,
+            pos=(0,0.12),
+            size=(618*0.001, 262*0.001)  # Adjust size as needed
+        )
+
+    def draw(self) -> None:
+        """Draws the image and text stimuli for the child on the window."""
+        self.image_stim.draw()
+        for text_stim in self.text_stims:
+            text_stim.draw()
+
+    def run_trial(self) -> None:
+        """Method for running the trial."""
+        event.clearEvents()
+        while True:
+            self.draw()
+            self.win.flip()
+            keys = event.getKeys(['space', 'escape'])
+            if config.CONTINUE_KEY in keys:
+                return True  # Continue with the experiment
+            if config.EXIT_KEY in keys:
+                return False  # End the experiment
+            core.wait(0.1)  # Small wait to prevent hammering the CPU
+
+
+class FinalIntroductionTrial:
+    """Class for the final introduction trial.
+    
+    Args:
+        win: psychopy window object."""
+    def __init__(self, win:visual.Window):
+        self.win = win
+        # Create text stimuli
+        # pylint: disable=line-too-long
+        self.text_stims = []
+        intro_text = [
+            "We are almost ready for the study.",
+            "Before we start, we have a few comprehension questions,",
+            "to make sure you understand the task.",
+            "The first few clips you will see will be full clips of a Ball falling in a scene.",
+            "After the first few clips, the Ball will begin to disappear after the first few frames of each clip, just like it will in the experiment.",
+            "Press spacebar to continue."
+        ]
+        # pylint: enable=line-too-long
+        y_positions = [
+            0.025,
+            0.0,
+            -0.025,
+            -0.05,
+            -0.075,
+            -0.1,]
+        y_positions = map(lambda x: x + .025, y_positions)
+        for text, y_pos in zip(intro_text, y_positions):
+            text_stim = visual.TextStim(
+                win=win,
+                text=text,
+                font='Arial',
+                pos=(0, y_pos),
+                height=0.015,
+                wrapWidth=1.5,
+                color='black',
+                alignText='center'
+            )
+            self.text_stims.append(text_stim)
+
+    def draw(self) -> None:
+        """Draws the text stimuli on the window."""
+        for text_stim in self.text_stims:
+            text_stim.draw()
+
+    def run_trial(self) -> None:
+        """Method for running the trial."""
+        event.clearEvents()
+        while True:
+            self.draw()
+            self.win.flip()
+            keys = event.getKeys(['space', 'escape'])
+            if config.CONTINUE_KEY in keys:
+                return True  # Continue with the experiment
+            if config.EXIT_KEY in keys:
+                return False  # End the experiment
+            core.wait(0.1)  # Small wait to prevent hammering the CPU
+
+
+class InstructionTrial:
+    """Class for the instruction trial.
+    
+    Gives participant instructions for the experiment.
+    
+    Args:
+        win: Pyshopy window object.
+        f_key: Flag for whether the f key is 'yes' or 'no'.
+        j_key: Flag for whether the j key is 'yes' or 'no'.
+        text_color: Color of the text on the window.
+    """
+
+    def __init__(
+            self,
+            win:visual.Window,
+            f_key:str='Yes',
+            j_key:str='No',
+            text_color:str='black'):
+        self.win = win
+        self.f_key = f_key
+        self.j_key = j_key
+        # Create the instruction text
+        instruction_text = (
+            f"In the next scene: Will the ball reach the goal?\n\n"
+            f"F: {self.f_key}, J: {self.j_key}\n\n"
+            "(Press spacebar to begin)"
+        )
+        self.text_stim = visual.TextStim(
+            win=win,
+            text=instruction_text,
+            pos=(0, 0),
+            height=0.02,
+            color=text_color,
+            colorSpace='rgb',
+            alignText='center'
+        )
+
+    def draw(self) -> None:
+        """Draws the text stimuli on the window."""
+        self.text_stim.draw()
+
+    def run_trial(self):
+        """Method for running the trial."""
+        event.clearEvents()
+        while True:
+            self.draw()
+            self.win.flip()
+            keys = event.getKeys(['space', 'q'])
+            if config.CONTINUE_KEY in keys:
+                return True  # Continue with the experiment
+            elif config.EXIT_KEY in keys:
+                return False  # End the experiment
+            core.wait(0.1)  # Small wait to prevent hammering the CPU
+
+
+class Fixation:
+    '''Class for fixation stimuli (crosses).
+    
+    Wraps around visual.ShapeStim.
+    '''
+
+    def __init__(self, win):
+        self.win = win
+        self.shape = visual.ShapeStim(
+            win=win,
+            vertices=((0, -0.05), (0, 0.05), (0, 0), (-0.05, 0), (0.05, 0)),
+            lineWidth=6,
+            lineColor='black',
+            closeShape=False,
+            colorSpace='rgb'
+        )
+
+    def draw(self):
+        '''This method overrides psychopy's weird lazy importing issues.
+        
+        If you don't do it this way, you'll get some weird type errors.
+        '''
+        self.shape.draw()
+
+    def run_trial(self):
+        duration = random.uniform(0.5, 2)
+        self.draw()
+        self.win.flip()
+        core.wait(duration)
+
+
+if __name__ == '__main__':
+    pass
