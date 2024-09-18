@@ -20,7 +20,7 @@ from config import VERSION
 import os
 
 DATA_PATH = f'data/exp/{VERSION}'
-SURVEY_PATH = f'data/survey'
+SURVEY_PATH = 'data/survey'
 CONFIG_PATH = f'config/{VERSION}'
 LOG_PATH = 'log'
 PSYCHO_LOG_PATH = 'psycho-log'
@@ -53,6 +53,7 @@ def stage(f):
 
     return wrapper
 
+
 def get_next_config_number():
     used = set()
     for fn in os.listdir(DATA_PATH):
@@ -70,6 +71,7 @@ def get_next_config_number():
 
 
 class Experiment(object):
+
     def __init__(self, config_number, name=None, full_screen=False, score_limit=400, **kws):
         if config_number is None:
             config_number = get_next_config_number()
@@ -77,15 +79,12 @@ class Experiment(object):
         print('>>>', self.config_number)
         self.full_screen = full_screen
         self.score_limit = score_limit
-
         timestamp = datetime.now().strftime('%y-%m-%d-%H%M')
         self.id = f'{timestamp}_P{config_number}'
         if name:
             self.id += '-' + str(name)
-
         self.setup_logging()
         logging.info('git SHA: ' + subprocess.getoutput('git rev-parse HEAD'))
-
         config_file = f'{CONFIG_PATH}/{config_number}.json'
         logging.info('Configuration file: ' + config_file)
         with open(config_file) as f:
@@ -94,20 +93,26 @@ class Experiment(object):
             self.parameters = conf['parameters']
         self.parameters.update(kws)
         logging.info('parameters %s', self.parameters)
-
         if 'gaze_tolerance' not in self.parameters:
             self.parameters['gaze_tolerance'] = 1.5
-
         self.win = self.setup_window()
         self.bonus = Bonus(0, 50)
         self.total_score = 0
         # self.bonus = Bonus(self.parameters['points_per_cent'], 50)
         self.eyelink = None
         self.disable_gaze_contingency = False
-
-        self._message = visual.TextBox2(self.win, '', pos=(-.83, 0), color='white', autoDraw=True, size=(0.65, None), letterHeight=.035, anchor='left')
+        self._message = visual.TextBox2(
+            self.win,
+            '',
+            pos=(-.83,
+            0),
+            color='white',
+            autoDraw=True,
+            size=(0.65,
+            None),
+            letterHeight=.035,
+            anchor='left')
         self._tip = visual.TextBox2(self.win, '', pos=(-.83, -0.2), color='white', autoDraw=True, size=(0.65, None), letterHeight=.025, anchor='left')
-
         # self._practice_trials = iter(self.trials['practice'])
         self.practice_i = -1
         self.trial_data = []
@@ -161,7 +166,6 @@ class Experiment(object):
         self.practice_data.append(gt.data)
         return gt
 
-
     @property
     def n_trial(self):
         return len(self.trials['main'])
@@ -185,7 +189,6 @@ class Experiment(object):
         psychopy.logging.LogFile(f"{PSYCHO_LOG_PATH}/{self.id}-psycho.log", level=logging.INFO, filemode='w')
         psychopy.logging.log(datetime.now().strftime('time is %Y-%m-%d %H:%M:%S,%f'), logging.INFO)
 
-
     def setup_window(self):
         size = (1350,750)
         win = visual.Window(size, allowGUI=True, units='height', fullscr=self.full_screen)
@@ -208,15 +211,32 @@ class Experiment(object):
         self.win.flip()
 
     def show_message(self):
+        '''Method for displaying the current message.'''
         self._message.autoDraw = True
         self._tip.autoDraw = True
 
-    def message(self, msg, space=False, tip_text=None):
+    def message(self, msg:str, space:bool=False, tip_text:str=None):
+        '''Method for logging and displaying messages to participant.
+        
+        Args:
+            msg: The message to show participant.
+            space: Boolean for whether you can use space to continue.
+            tip_text: Optional tip to display to participant.
+        '''
+        # Log the message and optional "tip" for participant
         logging.debug('message: %s (%s)', msg, tip_text)
+        # Show the message on screen
         self.show_message()
+        # Set the psychopy.visual TextBox object to the current text
         self._message.setText(msg)
-        self._tip.setText(tip_text if tip_text else 'press space to continue' if space else '')
+        # Set the psychopy.visual TextBox object to the current text
+        # pylint: disable=line-too-long
+        self._tip.setText(
+            tip_text if tip_text else 'press space to continue' if space else '')
+        # pylint: enable=line-too-long
+        # Flip the display window for participant
         self.win.flip()
+        # If space is flagged, allow waiting for space key being pressed
         if space:
             event.waitKeys(keyList=['space'])
 
@@ -283,8 +303,6 @@ class Experiment(object):
                      tip_text='complete the round to continue', space=False)
         gt.run(skip_planning=True)
 
-
-
     @stage
     def practice_change(self):
         gt = self.get_practice_trial()
@@ -312,12 +330,20 @@ class Experiment(object):
         self.message("If you run out of time, we'll make random decisions for you. Probably something to avoid.", space=True)
 
     @stage
-    def practice(self, n):
+    def practice(self, n:int) -> None:
+        '''Method for running practice trials.
+        
+        Args:
+            n: Number of trials.
+        '''
         intervened = False
+        # Iterate through the number of trial rounds
         for i in range(n):
-            self.message("Let's try a few more practice rounds.",
-                         space=False, tip_text=f'complete {n - i} practice rounds to continue')
-
+            # Set the current message on display for participant
+            self.message(
+                "Let's try a few more practice rounds.",
+                space=False,
+                tip_text=f'complete {n - i} practice rounds to continue')
             gt = self.get_practice_trial()
             for i in range(3):
                 gt.run()
@@ -359,7 +385,6 @@ class Experiment(object):
         self.hide_message()
         self.eyelink.calibrate()
         self.calibrate_gaze_tolerance()
-
 
     @stage
     def show_gaze_demo(self):
@@ -450,7 +475,6 @@ class Experiment(object):
 
         self.message("Great! If you ever find that the points don't appear when you look at them, "
             "please let the experimenter know so we can fix it!", space=True)
-
 
     @stage
     def intro_main(self):
@@ -624,6 +648,3 @@ class Experiment(object):
         with open(fp, 'w') as f:
             f.write(str(self.all_data))
         logging.info('wrote %s', fp)
-
-
-
