@@ -1,8 +1,20 @@
-from experiment import Experiment
-from fire import Fire
+"""Main entrypoint for running eyetracking experiments."""
 import logging
 
-def main(config_number=None, name=None, test=False, fast=False, full=False, mouse=False, hotfix=False, **kws):
+from fire import Fire
+
+from experiment import Experiment
+
+
+def main_old(
+        config_number=None,
+        name=None,
+        test=False,
+        fast=False,
+        full=False,
+        mouse=False,
+        hotfix=False,
+        **kws):
     if test and name is None:
         name = 'test'
     if fast:
@@ -70,6 +82,9 @@ def main(config_number=None, name=None, test=False, fast=False, full=False, mous
                 exp.emergency_save_data()
                 raise
 
+
+def main():
+    pass
 
 if __name__ == '__main__':
     Fire(main)
