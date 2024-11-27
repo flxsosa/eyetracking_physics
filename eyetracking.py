@@ -1,3 +1,5 @@
+"""Utilities and classes for EyeLink interface and using mouse as gaze data."""
+
 import hashlib
 import logging
 import os
@@ -96,7 +98,6 @@ def height2pix(
         Adjusted position (x,y).
     '''
     assert win.units == 'height'
-    print(f"Win size: {win.size}")
     if retina:
         w, h = win.size / 2  # eyetracker uses non-retina pixels
     else:
@@ -358,7 +359,6 @@ class EyeLink(object):
         if sample is None:
             return (-100000, -100000)
         eye = sample.getLeftEye() or sample.getRightEye()
-        print(f'EyeTracker Gaze Pos: {eye.getGaze()}')
         return eye.getGaze()
 
     def close_connection(self) -> None:
@@ -422,7 +422,6 @@ class MouseLink(EyeLink):
         return
 
     def gaze_position(self):
-        print(f'Gaze Position (Mouse): {self.mouse.getPos()}')
         return self.mouse.getPos()
 
     def close_connection(self):
@@ -431,18 +430,4 @@ class MouseLink(EyeLink):
 
 
 if __name__ == '__main__':
-    mon = monitors.Monitor('myMonitor', width=53.0, distance=70.0)
-    win = visual.Window(fullscr=False,
-                        monitor=mon,
-                        # winType='pyglet',
-                        units='pix')
-    el = MouseLink(win, 'oct9', dummy_mode=False)
-    print('try to calibrate')
-    # el.tracker.sendCommand("calibration_type = HV3")
-    el.setup_calibration()
-    el.calibrate()
-    print('success!')
-    el.start_recording()
-    time.sleep(5)
-    el.message("TEST MESSAGE")
-    el.save_data()
+    pass
