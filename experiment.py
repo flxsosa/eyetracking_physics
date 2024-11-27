@@ -1,29 +1,27 @@
-import os
-import logging
-import json
-import re
+from copy import deepcopy
 from datetime import datetime
+import json
+import logging
+import os
+import re
+import subprocess
+
+import numpy as np
 import psychopy
 from psychopy import core, visual, gui, data, event
-from psychopy.tools.filetools import fromFile, toFile
-import numpy as np
 
-from util import jsonify
-from trial import GraphTrial, CalibrationTrial, COLOR_ACT, COLOR_PLAN
-from graphics import Graphics
-from bonus import Bonus
+from config import VERSION
+from trial import COLOR_ACT, COLOR_PLAN
 from eyetracking import EyeLink, MouseLink
 
-import subprocess
-from copy import deepcopy
-from config import VERSION
-import os
 
 DATA_PATH = f'data/exp/{VERSION}'
 SURVEY_PATH = 'data/survey'
 CONFIG_PATH = f'config/{VERSION}'
 LOG_PATH = 'log'
 PSYCHO_LOG_PATH = 'psycho-log'
+
+
 for p in (DATA_PATH, CONFIG_PATH, LOG_PATH, PSYCHO_LOG_PATH, SURVEY_PATH):
     os.makedirs(p, exist_ok=True)
 
