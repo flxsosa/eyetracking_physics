@@ -1,9 +1,9 @@
 """Utilities for defining experimental trials for eyetracking experiment."""
 
+import os
 import random
 import time
 
-import numpy as np
 # NOTE: These packages are lazily imported
 from psychopy import core, visual, event
 
@@ -11,403 +11,135 @@ import config
 import eyetracking
 
 
-class VideoTrial:
-    '''Class for playing videos and collecting eye tracking data real time.
+class Block:
+    """For type annotations."""
+
+
+class Trial:
+    """For type annotations."""
+
+
+class ImageTrial(Trial):
+    """A class wrapper for a psychopy ImageStim.
     
-    Args:
-        eyelink: The pylink.EyeLink object (tracker).
-        video_path: The path to the video to be played.
-        win: Psychopy window object.
-    '''
+    Attributes:
+        win: The psychopy window to render the stimulus to.
+        image_path: The path to the image.
+        timed: Whether the trial ends on its own (T), or by button press (F).
+    """
     def __init__(
             self,
-            eyelink:eyetracking.EyeLink | eyetracking.MouseLink,
-            video_path:str,
             win:visual.Window,
-            id:int):
-        self.eyelink = eyelink
-        self.gaze_data = []
-        self.video_start_time = None
-        self._video_is_playing = True
-        self._last_frame = None
+            image_path,
+            timed=False):
         self.win = win
-        self.id = id
-        self.scene_name = video_path.split('/')[-1].split('.')[0]
-        self.video_path = video_path
-        width = 800*.98
-        height = 1000*.98
-        # Create the video stimulus with the new size
-        self.video = visual.MovieStim(
+        self.timed = timed
+        # Create the image stimulus showing the controller
+        self.image_stim = visual.ImageStim(
             win=self.win,
-            filename=video_path,
-            size=(width, height),
-            pos=(0, 0),  # Center the video
-            noAudio=True
+            image=image_path,
+            pos=(0,0)
         )
 
-    def play_video(self) -> None:
-        '''Method for playing video stimulus to participant frame by frame.'''
-        self.video_start_time = time.time()
-        # Send video stimulus onset message
-        self.eyelink.message('VIDEO_STIM_ONSET')
-        # Play the video stimulus
-        self.video.play()
+    def draw(self) -> None:
+        """Draws the text stimuli on the window."""
+        self.image_stim.draw()
+
+    def run(self):
+        """Method for running the trial."""
+        if self.timed:
+            self.draw()
+            self.win.flip()
+            time.sleep(0.5)
+            return
+        while True:
+            self.draw()
+            self.win.flip()
+            keys = event.getKeys([config.YELLOW_BUTTON])
+            if config.YELLOW_BUTTON in keys:
+                return True  # Continue with the experiment
+            event.clearEvents()
+
+
+class VideoTrial(Trial):
+    """A class wrapper for a psychopy MovieStim.
+    
+    Attributes:
+        end_keys: Which keys end the trial.
+        win: The psychopy window to render the stimulus to.
+        path: The path to the video.
+    """
+
+    def __init__(
+            self, path:str, end_keys:list[str], win:visual.Window):
+        self.path = path
+        self.name = path.split('/')[-1].split('.')[0]
+        self.end_keys = end_keys
+        self.video = None
+        self.response = None
+        self.rt = None
+        self.win = win
+
+    def _play_button(self, eyelink):
         event.clearEvents()
-        frame_count = 0
-        while self.video.status != visual.FINISHED:
-            # NOTE: Make sure this works
-            # Send data viewer video frame message
-            self.eyelink.message('!V VRAME %d %d %d %s' % (
-                frame_count,
-                self.win.size[0]/2-self.video.size[0]/2,
-                self.win.size[1]/2-self.video.size[1]/2,
-                self.video_path
-            ))
+        eyelink.message('VIDEO_START')
+        self.video.play()
+        while True:
             # Draw video frame
             self.video.draw()
-            self.win.flip()
-            self.update_gaze()
-            keys = event.getKeys(['f','j'])
-            if 'j' in keys or 'f' in keys:
-                self.eyelink.message('BUTTON_PRESS')
-                return keys  # Move to next trial
-            if config.EXIT_KEY in keys:
-                self.eyelink.message('BUTTON_PRESS')
-                return False # Exit experiment
-            frame_count += 1
-        # Video has finished, show last frame indefinitely until response
+            self.video.win.flip()
+            keys = event.getKeys(self.end_keys)
+            for key in self.end_keys:
+                if key in keys:
+                    # Move to next video
+                    self.video.stop()
+                    eyelink.message('BUTTON_PRESS %s' % key)
+                    eyelink.message('VIDEO_END')
+                    return key
+            event.clearEvents()
+
+    def _play_timed(self, eyelink):
         event.clearEvents()
-        while True:
-            self.video.draw()  # This will draw the last frame
-            self.win.flip()
-            self.update_gaze()
-            keys = event.getKeys(['f','j'])
-            if 'j' in keys or 'f' in keys:
-                self.eyelink.message('BUTTON_PRESS')
-                return keys  # Move to next trial
-            if config.EXIT_KEY in keys:
-                self.eyelink.message('BUTTON_PRESS')
-                return False # Exit experiment
-
-    def start_video_and_tracking(self) -> None:
-        '''Method for initiating video playback and eye tracker.'''
-        self.eyelink.start_recording()
-        self.play_video()
-
-    def update_gaze(self) -> None:
-        """Samples current gaze position and records it in pixels."""
-        if not self.eyelink:
-            return
-        current_time = time.time() - self.video_start_time
-        gaze_sample = self.eyelink.gaze_position()
-        # Convert gaze coordinates to PsychoPy coordinates
-        # Return gaze data in pixel values
-        gaze_x = gaze_sample[0]
-        gaze_y = gaze_sample[1]
-        if self.eyelink.win.units == 'height':
-            gaze_x, gaze_y = eyetracking.height2pix(
-                self.eyelink.win, (gaze_x, gaze_y))
-        # Store gaze data with timestamp
-        self.gaze_data.append((current_time, gaze_x, gaze_y))
-
-    def stop_video_and_tracking(self) -> None:
-        """Stop recording from eye tracker."""
-        self.eyelink.stop_recording()
+        eyelink.message('VIDEO_START')
+        self.video.play()
+        while not self.video.isFinished:
+            # Draw video frame
+            self.video.draw()
+            self.video.win.flip()
         self.video.stop()
-        # Get participant response time
-        response_time = time.time() - self.video_start_time
-        # Send trial variable info
-        self.eyelink.message('!V TRIAL_VAR trial_index %d' % (self.id))
-        self.eyelink.message('!V TRIAL_VAR scene_name %s' % (
-            self.scene_name))
-        self.eyelink.message('!V TRIAL_VAR rt %f' % (response_time))
-
-    def run_trial(self) -> None:
-        """Run forward the video trial."""
-        # Send trial onset message
-        self.eyelink.message('TRIAL_START')
-        self.start_video_and_tracking()
-        self.stop_video_and_tracking()
-        # Send trial offset message
-        self.eyelink.message('TRIAL_END')
-
-
-class IntroductionTrial:
-    """Class for introduction trials.
-    
-    Args:
-        win: Psychopy window object.
-        image_path: The path to the image displayed in the intro trial.
-    """
-    def __init__(
-            self,
-            win:visual.Window,
-            image_path:str='data/introduction/scene_cp_2_arrow.jpg'):
-        self.win = win
-        # Index for which intro slide the trial is on
-        self.slide_number = 0
-        # Create text stimuli
-        # pylint: disable=line-too-long
-        self.text_stims = []
-        intro_text = [
-            "In this experiment, you will see 48 short clips of scenes like the one above.",
-            "In each clip, there will be a BALL, a GOAL, and multiple SLIDES.",
-            "The BALL will always be a circle.",
-            "The GOAL will always be a rectangle.",
-            "The SLIDES might change location and size from clip to clip.",
-            "The BALL and GOAL may change colors from clip to clip.",
-            "In each clip, the BALL will turn invisible, but you are to assume it's still in the scene.",
-            "YOUR TASK:",
-            "1. Judge whether the BALL will ever reach the GOAL.",
-            "Press spacebar for further instructions."
-        ]
-        # pylint: enable=line-too-long
-        y_positions = [
-            0.025,
-            0.0,
-            -0.025,
-            -0.05,
-            -0.075,
-            -0.1,
-            -0.125,
-            -0.15,
-            -0.175,
-            -0.2]
-        y_positions = map(lambda x: x - .2, y_positions)
-        for text, y_pos in zip(intro_text, y_positions):
-            text_stim = visual.TextStim(
-                win=win,
-                text=text,
-                font='Arial',
-                pos=(0, y_pos),
-                height=0.015,
-                wrapWidth=1.5,
-                color='black',
-                alignText='center'
-            )
-            self.text_stims.append(text_stim)
-        # Create image stimulus
-        self.image_stim = visual.ImageStim(
-            win=win,
-            image=image_path,
-            pos=(0, 0.12),
-            size=(800*0.0005, 1000*0.0005)  # Adjust size as needed
-        )
-
-    def draw(self) -> None:
-        """Draws the text and image stimuli onto the window."""
-        self.image_stim.draw()
-        for text_stim in self.text_stims:
-            text_stim.draw()
-
-    def run_trial(self) -> None:
-        """Method for running the trial."""
+        eyelink.message('VIDEO_END')
         event.clearEvents()
-        while True:
-            self.draw()
-            self.win.flip()
-            keys = event.getKeys(['space', 'escape'])
-            if 'space' in keys:
-                return True  # Continue with the experiment
-            if config.EXIT_KEY in keys:
-                return False  # End the experiment
-            core.wait(0.1)  # Small wait to prevent hammering the CPU
+        return
 
-
-class KeyboardIntroductionTrial:
-    """Class for keyboard introduction trials.
-    
-    These trials display the controls to the participant.
-    
-    Args:
-        win: psychopy window object.
-        yes_key: The assigned key for the 'yes' response in the experiment.
-        no_key: The assigned key for the 'no' response in the experiment.
-    """
-    def __init__(self, win:visual.Window, yes_key:str, no_key:str):
-        self.win = win
-        image_path=f'data/introduction/keyboard_{yes_key}.jpeg'
-        # Create text stimuli
-        # pylint: disable=line-too-long
-        # NOTE: Put this in config
-        timeout = 5000
-        self.text_stims = []
-        intro_text = [
-            f"If the Ball WILL reach the Goal: press the letter `{yes_key}` on your keyboard.",
-            f"If the Ball WON'T reach the Goal: press the letter `{no_key}` on your keyboard",
-            f"Each clip will only be available for `{timeout/1000}` seconds",
-            "Please answer as fast and as accurately as possible!",
-            "You do not have to wait for the clip to finish to answer!",
-            "Press spacebar to continue."
-        ]
-        # pylint: enable=line-too-long
-        y_positions = [
-            0.025,
-            0.0,
-            -0.025,
-            -0.05,
-            -0.075,
-            -0.1,]
-        y_positions = map(lambda x: x - .1, y_positions)
-        for text, y_pos in zip(intro_text, y_positions):
-            text_stim = visual.TextStim(
-                win=win,
-                text=text,
-                font='Arial',
-                pos=(0, y_pos),
-                height=0.015,
-                wrapWidth=1.5,
-                color='black',
-                alignText='center'
-            )
-            self.text_stims.append(text_stim)
-        # Create image stimulus
-        self.image_stim = visual.ImageStim(
-            win=win,
-            image=image_path,
-            pos=(0,0.12),
-            size=(618*0.001, 262*0.001)  # Adjust size as needed
-        )
-
-    def draw(self) -> None:
-        """Draws the image and text stimuli for the child on the window."""
-        self.image_stim.draw()
-        for text_stim in self.text_stims:
-            text_stim.draw()
-
-    def run_trial(self) -> None:
-        """Method for running the trial."""
-        event.clearEvents()
-        while True:
-            self.draw()
-            self.win.flip()
-            keys = event.getKeys(['space', 'escape'])
-            if config.CONTINUE_KEY in keys:
-                return True  # Continue with the experiment
-            if config.EXIT_KEY in keys:
-                return False  # End the experiment
-            core.wait(0.1)  # Small wait to prevent hammering the CPU
-
-
-class FinalIntroductionTrial:
-    """Class for the final introduction trial.
-    
-    Args:
-        win: psychopy window object."""
-    def __init__(self, win:visual.Window):
-        self.win = win
-        # Create text stimuli
-        # pylint: disable=line-too-long
-        self.text_stims = []
-        intro_text = [
-            "We are almost ready for the study.",
-            "Before we start, we have a few comprehension questions,",
-            "to make sure you understand the task.",
-            "The first few clips you will see will be full clips of a Ball falling in a scene.",
-            "After the first few clips, the Ball will begin to disappear after the first few frames of each clip, just like it will in the experiment.",
-            "Press spacebar to continue."
-        ]
-        # pylint: enable=line-too-long
-        y_positions = [
-            0.025,
-            0.0,
-            -0.025,
-            -0.05,
-            -0.075,
-            -0.1,]
-        y_positions = map(lambda x: x + .025, y_positions)
-        for text, y_pos in zip(intro_text, y_positions):
-            text_stim = visual.TextStim(
-                win=win,
-                text=text,
-                font='Arial',
-                pos=(0, y_pos),
-                height=0.015,
-                wrapWidth=1.5,
-                color='black',
-                alignText='center'
-            )
-            self.text_stims.append(text_stim)
-
-    def draw(self) -> None:
-        """Draws the text stimuli on the window."""
-        for text_stim in self.text_stims:
-            text_stim.draw()
-
-    def run_trial(self) -> None:
-        """Method for running the trial."""
-        event.clearEvents()
-        while True:
-            self.draw()
-            self.win.flip()
-            keys = event.getKeys(['space', 'escape'])
-            if config.CONTINUE_KEY in keys:
-                return True  # Continue with the experiment
-            if config.EXIT_KEY in keys:
-                return False  # End the experiment
-            core.wait(0.1)  # Small wait to prevent hammering the CPU
-
-
-class InstructionTrial:
-    """Class for the instruction trial.
-    
-    Gives participant instructions for the experiment.
-    
-    Args:
-        win: Pyshopy window object.
-        f_key: Flag for whether the f key is 'yes' or 'no'.
-        j_key: Flag for whether the j key is 'yes' or 'no'.
-        text_color: Color of the text on the window.
-    """
-
-    def __init__(
-            self,
-            win:visual.Window,
-            f_key:str='Yes',
-            j_key:str='No',
-            text_color:str='black'):
-        self.win = win
-        self.f_key = f_key
-        self.j_key = j_key
-        # Create the instruction text
-        instruction_text = (
-            f"In the next scene: Will the ball reach the goal?\n\n"
-            f"F: {self.f_key}, J: {self.j_key}\n\n"
-            "(Press spacebar to begin)"
-        )
-        self.text_stim = visual.TextStim(
-            win=win,
-            text=instruction_text,
+    def play(self, eyelink):
+        self.video = visual.MovieStim(
+            win=self.win,
+            filename=self.path,
+            size=(
+                config.DEFAULT_WIDTH * config.STIM_SCALE,
+                config.DEFAULT_HEIGHT * config.STIM_SCALE),
             pos=(0, 0),
-            height=0.02,
-            color=text_color,
-            colorSpace='rgb',
-            alignText='center'
+            noAudio=True
         )
-
-    def draw(self) -> None:
-        """Draws the text stimuli on the window."""
-        self.text_stim.draw()
-
-    def run_trial(self):
-        """Method for running the trial."""
         event.clearEvents()
-        while True:
-            self.draw()
-            self.win.flip()
-            keys = event.getKeys(['space', 'q'])
-            if config.CONTINUE_KEY in keys:
-                return True  # Continue with the experiment
-            elif config.EXIT_KEY in keys:
-                return False  # End the experiment
-            core.wait(0.1)  # Small wait to prevent hammering the CPU
+        if self.end_keys:
+            self.response = self._play_button(eyelink)
+            event.clearEvents()
+        else:
+            self._play_timed(eyelink)
+            event.clearEvents()
+        event.clearEvents()
+        self.video = None
 
 
-class Fixation:
-    '''Class for fixation stimuli (crosses).
+class FixationTrial(Trial):
+    """A class wrapper for fixation stimuli (cross).
     
     Wraps around visual.ShapeStim.
-    '''
+
+    Attributes:
+        win: The window to render the shape to.
+    """
 
     def __init__(self, win):
         self.win = win
@@ -427,11 +159,143 @@ class Fixation:
         '''
         self.shape.draw()
 
-    def run_trial(self):
+    def run(self):
+        """Method for running trial."""
         duration = random.uniform(0.5, 2)
         self.draw()
         self.win.flip()
         core.wait(duration)
+        event.clearEvents()
+
+
+class ExperimentBlock(Block):
+    '''Class for an Experiment Block.
+
+    An ExperimentBlock is a tuple of VideoTrials, usually a pre-, intra-, and
+    post-video of a given scene.
+    
+    Args:
+        eyelink: The pylink.EyeLink object (tracker).
+        videos: The sequence of VideoTrials that make the block.
+        win: Psychopy window object.
+        id: The id of the Block.
+    '''
+    def __init__(
+            self,
+            eyelink:eyetracking.EyeLink,
+            win,
+            videos:list[VideoTrial],
+            id:int):
+        self.eyelink = eyelink
+        self.videos = videos
+        self.response_recorded = visual.ImageStim(
+            win=win,
+            image='data/introduction/experiment_recorded.png',
+            pos=(0,0)
+        )
+        self.gaze_data = []
+        self.video_start_time = None
+        self.id = id
+        self.responses = {}
+
+    def stop_video_and_tracking(self, video) -> None:
+        """Stop recording from eye tracker."""
+        self.eyelink.stop_recording()
+        # Get participant response time
+        response_time = time.time() - self.video_start_time
+        # Send trial variable info
+        self.eyelink.message('!V TRIAL_VAR trial_index %d' % (self.id))
+        self.eyelink.message('!V TRIAL_VAR scene_name %s' % (
+            video.name))
+        self.eyelink.message('!V TRIAL_VAR rt %f' % (response_time))
+        video.rt = response_time
+        event.clearEvents()
+
+    def run(self) -> None:
+        """Run forward the video trial."""
+        # Send trial onset message
+        self.eyelink.message('BLOCK_START')
+        for trial_index, v in enumerate(self.videos):
+            self.eyelink.message('TRIAL_START')
+            self.eyelink.start_recording()
+            self.video_start_time = time.time()
+            v.play(eyelink=self.eyelink)
+            self.stop_video_and_tracking(v)
+            self.responses[v.name] = {'response': v.response, 'rt': v.rt}
+            self.eyelink.message('!V TRIAL_VAR trial_index %d' % (trial_index))
+            self.eyelink.message('TRIAL_END')
+        self.eyelink.message('!V TRIAL_VAR block_index %d' % (self.id))
+        self.eyelink.message('BLOCK_END')
+        self.response_recorded.draw()
+        self.response_recorded.win.flip()
+        time.sleep(0.5)
+
+        # Send trial offset message
+
+
+class ComprehensionBlock(Block):
+    '''Class for a Comprehension Block.
+
+    A ComprehensionBlock is a tuple of VideoTrials, usually a pre-, intra-, and
+    post-video of a given scene.
+    
+    Args:
+        eyelink: The pylink.EyeLink object (tracker).
+        videos: The sequence of VideoTrials that make the block.
+        correct_response: The correct response to the Block.
+        id: The id of the Block.
+    '''
+    def __init__(
+            self,
+            eyelink:eyetracking.EyeLink | eyetracking.MouseLink,
+            videos:list[VideoTrial],
+            correct_response:str,
+            id:int):
+        self.eyelink = eyelink
+        self.videos = videos
+        self.gaze_data = []
+        self.video_start_time = None
+        self.id = id
+        self.correct_response = correct_response
+        self.passed = None
+        self.responses = {}
+
+    def reset(self):
+        self.passed = None
+        self.responses = {}
+        self.video_start_time = None
+        self.gaze_data = []
+
+    def stop_video_and_tracking(self, video) -> None:
+        """Stop recording from eye tracker."""
+        event.clearEvents()
+        self.eyelink.stop_recording()
+        # Get participant response time
+        response_time = time.time() - self.video_start_time
+        # Send trial variable info
+        self.eyelink.message('!V TRIAL_VAR trial_index %d' % (self.id))
+        self.eyelink.message('!V TRIAL_VAR scene_name %s' % (
+            video.name))
+        self.eyelink.message('!V TRIAL_VAR rt %f' % (response_time))
+        video.rt = response_time
+        event.clearEvents()
+
+    def run(self) -> None:
+        """Run forward the video trial."""
+        # Send trial onset message
+        self.eyelink.message('BLOCK_START')
+        for v in self.videos:
+            self.eyelink.message('TRIAL_START')
+            self.eyelink.start_recording()
+            self.video_start_time = time.time()
+            v.play(eyelink=self.eyelink)
+            self.stop_video_and_tracking(v)
+            self.responses[v.name] = {'response': v.response, 'rt': v.rt}
+            if '_post' in v.name:
+                self.passed = self.correct_response == v.response
+            self.eyelink.message('TRIAL_END')
+        # Send trial offset message
+        self.eyelink.message('BLOCK_END')
 
 
 if __name__ == '__main__':
