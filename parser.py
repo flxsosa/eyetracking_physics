@@ -3,225 +3,166 @@
 from collections import namedtuple
 import re
 
+# Precompile all regex patterns for better performance
+BLOCK_START_RE = re.compile(r'MSG\s+(\d+)\s+BLOCK_START')
+BLOCK_END_RE = re.compile(r'MSG\s+(\d+)\s+BLOCK_END') 
+TRIAL_START_RE = re.compile(r'MSG\s+(\d+)\s+TRIAL_START')
+TRIAL_END_RE = re.compile(r'MSG\s+(\d+)\s+TRIAL_END')
+BUTTON_PRESS_RE = re.compile(r'MSG\s+(\d+)\s+BUTTON_PRESS\s+([a-z_]+)')
+VIDEO_START_RE = re.compile(r'MSG\s+(\d+)\s+VIDEO_START')
+TRIAL_VAR_RE = re.compile(r'MSG\s+(\d+)\s+!V\s+TRIAL_VAR\s+([a-z_]+)\s+([a-z0-9_.]+)')
+FIXATION_RE = re.compile(r'EFIX (L|R)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+)')
+SACCADE_RE = re.compile(r'ESACC (L|R)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+)')
+BLINK_RE = re.compile(r'EBLINK (L|R)\s+(\d+)\s+(\d+)\s+(\d+)')
+GAZE_RE = re.compile(r'(\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+).*\.\.\.') 
 
 # Parser data types
 Fixation = namedtuple('Fixation', ['start', 'stop', 'x', 'y'])
-
-
-Gaze = namedtuple(
-    'Gaze',
-    ['time', 'x', 'y', 'fixation', 'saccade', 'blink', 'event'])
-
-
+Gaze = namedtuple('Gaze', ['time', 'x', 'y', 'pupil'])
 Mouse = namedtuple('Mouse', ['time', 'x', 'y'])
-
-
-Saccade = namedtuple(
-    'Saccade',
-    [
-        'start',
-        'stop',
-        'start_x',
-        'start_y',
-        'end_x',
-        'end_y',
-        'amp',
-        'peak_vel'
-    ])
-
-
+Saccade = namedtuple('Saccade', ['start', 'stop', 'start_x', 'start_y', 'end_x', 'end_y', 'amp', 'peak_vel'])
 Blink = namedtuple('Blink', ['start', 'stop'])
-
 
 def parse_eyedata(asc_file='data/pilots/test/raw.asc') -> dict:
     """Parses .asc files recorded from the EyeLink eye tracker."""
     # Trial lists
     trials = []
+    # Block information
+    block_idx = None
+    block_time_start = None
+    block_time_end = None
+    block_duration = None
+
+    # Trial information
     trial_idx = None
     trial_time_start = None
     trial_time_end = None
-    button_press_time = None
+    trial_duration = None
+    button_response = None
     stim_onset_time = None
     scene_name = None
     response_time = None
+    trial = {}
+
     # Event lists
     fixations = []
     saccades = []
     blinks = []
     gaze = []
-    # Flags denoting what event the eye data is related to
-    is_fixation_event = False
-    is_saccade_event = False
-    is_blink_event = False
-    event_flag = 'None'
-    trial = None
+
     with open(asc_file, 'r') as f:
         for line in f:
-            if line.startswith("SFIX"):
-                is_fixation_event = True
-                event_flag = 'fixation'
-            if line.startswith("SSAC"):
-                is_saccade_event = True
-                event_flag = 'saccade'
-            if line.startswith('SBLINK'):
-                is_blink_event = True
-                event_flag = 'blink'
+            # Parse trial start messages e.g. "MSG 314108 BLOCK_START"
+            if m := BLOCK_START_RE.match(line):
+                block_time_start = float(m.group(1)) / 1000
+                continue
+
+            # Parse trial end messages e.g. "MSG 314108 BLOCK_END"
+            if m := BLOCK_END_RE.match(line):
+                block_time_end = float(m.group(1)) / 1000
+                block_duration = block_time_end - block_time_start
+                block_idx = None
+                continue
+            
             # Parse trial start messages e.g. "MSG 314108 TRIAL_START"
-            m = re.match(r'MSG\s+(\d+)\s+TRIAL_START', line)
-            if m:
-                trial_time_start = list(map(float, m.groups()))[0]
-                trial_time_start /= 1000  # to seconds
-                # trial_start_times.append(trial_time_start)
-                if trial is None:
-                    trial = {}
-                    trial['start_time'] = trial_time_start
-                else:
-                    assert ValueError("Should be empty")
+            if m := TRIAL_START_RE.match(line):
+                trial_time_start = float(m.group(1)) / 1000
+                assert trial == {}, ValueError("Should be empty")
                 continue
+
             # Parse trial end messages e.g. "MSG 314108 TRIAL_END"
-            m = re.match(r'MSG\s+(\d+)\s+TRIAL_END', line)
-            if m:
-                trial_time_end = list(map(float, m.groups()))[0]
-                trial_time_end /= 1000  # to seconds
-                if trial is not None:
-                    trial['idx'] = trial_idx
-                    trial['end_time'] = trial_time_end
-                    trial['gaze'] = gaze
-                    trial['fixations'] = fixations
-                    trial['saccades'] = saccades
-                    trial['blinks'] = blinks
-                    trial['response_time'] = response_time
-                    trial['scene_name'] = scene_name
-                    trial['button_press_time'] = button_press_time
-                    trial['stimulus_onset_time'] = stim_onset_time
-                    trials.append(trial)
-                    trial_idx = None
-                    trial_time_start = None
-                    trial_time_end = None
-                    button_press_time = None
-                    stim_onset_time = None
-                    scene_name = None
-                    response_time = None
-                    # Event lists
-                    fixations = []
-                    saccades = []
-                    blinks = []
-                    gaze = []
-                    # Flags denoting what event the eye data is related to
-                    is_fixation_event = False
-                    is_saccade_event = False
-                    is_blink_event = False
-                    event_flag = 'None'
-                    trial = None
+            if m := TRIAL_END_RE.match(line):
+                trial_time_end = float(m.group(1)) / 1000
+                trial_duration = trial_time_end - trial_time_start
+                
+                # Build trial dict all at once
+                trial = {
+                    'block_idx': block_idx,
+                    'block_time_start': block_time_start,
+                    'block_time_end': block_time_end, 
+                    'block_duration': block_duration,
+                    'idx': trial_idx,
+                    'trial_time_start': trial_time_start,
+                    'trial_time_end': trial_time_end,
+                    'trial_duration': trial_duration,
+                    'response_time': response_time,
+                    'scene_name': scene_name,
+                    'button_response': button_response,
+                    'stimulus_onset_time': stim_onset_time,
+                    'gaze': gaze,
+                    'fixations': fixations,
+                    'saccades': saccades,
+                    'blinks': blinks
+                }
+
+                trials.append(trial)
+
+                # Reset all trial variables at once
+                trial_idx = trial_time_start = trial_time_end = button_response = None
+                stim_onset_time = scene_name = response_time = None
+                fixations, saccades, blinks, gaze = [], [], [], []
+                trial = {}
                 continue
+            
             # Parse trial end messages e.g. "MSG 314108 BUTTON_PRESS"
-            m = re.match(r'MSG\s+(\d+)\s+BUTTON_PRESS', line)
-            if m:
-                button_press_time = list(map(float, m.groups()))[0]
-                button_press_time /= 1000  # to seconds
+            if m := BUTTON_PRESS_RE.match(line):
+                button_response = m.group(2)
                 continue
-            # Parse trial end messages e.g. "MSG 314108 VIDEO_STIM_ONSET"
-            m = re.match(r'MSG\s+(\d+)\s+VIDEO_STIM_ONSET', line)
-            if m:
-                stim_onset_time = list(map(float, m.groups()))[0]
-                stim_onset_time /= 1000  # to seconds
+
+            # Parse trial end messages e.g. "MSG 314108 VIDEO_START"
+            if m := VIDEO_START_RE.match(line):
+                stim_onset_time = float(m.group(1)) / 1000
                 continue
-            # Parse trial variable messages e.g.
-            #   "MSG 314108 !V TRIAL_VAR variable value"
-            m = re.match(
-                r'MSG\s+(\d+)\s+!V\s+TRIAL_VAR\s+([a-z_]+)\s+([a-z0-9_.]+)',
-                line)
-            if m:
-                mgs = list(m.groups())
-                # Convert time to seconds
-                onset_time = float(mgs[0]) / 1000
-                for g in m.groups():
-                    # RT variable
-                    if g == 'rt':
-                        response_time = float(mgs[-1])
-                    # Scene name variable
-                    if g == 'scene_name':
-                        scene_name = mgs[-1]
-                    # Trial index variable
-                    if g == 'trial_index':
-                        trial_idx = int(mgs[-1])
+
+            # Parse trial variable messages
+            if m := TRIAL_VAR_RE.match(line):
+                onset_time = float(m.group(1)) / 1000
+                var_name = m.group(2)
+                value = m.group(3)
+                
+                if var_name == 'rt':
+                    response_time = float(value)
+                elif var_name == 'scene_name':
+                    scene_name = value
+                elif var_name == 'trial_index':
+                    trial_idx = int(value)
+                elif var_name == 'block_index':
+                    block_idx = int(value)
                 continue
-            # Parse fixation events "EFIX R 314120 314632 513 961.9 553.5 1170"
-            # pylint: disable=line-too-long
-            m = re.match(r'EFIX (L|R)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+)', line)
-            # pylint: enable=line-too-long
-            if m:
-                is_fixation_event = False
-                event_flag = 'None'
-                which_eye, start, stop, dur, x, y, pupil = m.groups()
-                start, stop, dur, pupil = map(float, (start, stop, dur, pupil))
-                # Map times to seconds
-                start /= 1000
-                stop /= 1000
-                dur /= 1000
-                x, y = map(float, (x, y))
+
+            # Parse fixation events
+            if m := FIXATION_RE.match(line):
+                _, start, stop, dur, x, y, pupil = m.groups()
+                start, stop = float(start)/1000, float(stop)/1000
+                x, y = float(x), float(y)
                 fixations.append(Fixation(start, stop, x, y))
                 continue
-            # Parse saccade events e.g.
-            #   "ESACC R 344176 344200 25 973.7 575.1 965.6 440.6 2.29 134"
-            # pylint: disable=line-too-long
-            m = re.match(
-                r'ESACC (L|R)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+)',
-                line)
-            # pylint: enable=line-too-long
-            if m:
-                mgs = list(m.groups())
-                is_saccade_event = False
-                event_flag = 'None'
-                # pylint: disable=line-too-long
-                start, stop, dur, start_x, start_y, end_x, end_y, amp, peak_vel = map(float, mgs[1:])
-                # pylint: enable=line-too-long
-                # Map times to seconds
-                start /= 1000
-                stop /= 1000
-                dur /= 1000
-                saccades.append(
-                    Saccade(
-                        start,
-                        stop,
-                        start_x,
-                        start_y,
-                        end_x,
-                        end_y,
-                        amp,
-                        peak_vel
-                    ))
+
+            # Parse saccade events
+            if m := SACCADE_RE.match(line):
+                groups = m.groups()
+                start = float(groups[1])/1000
+                stop = float(groups[2])/1000
+                start_x, start_y = float(groups[4]), float(groups[5])
+                end_x, end_y = float(groups[6]), float(groups[7])
+                amp, peak_vel = float(groups[8]), float(groups[9])
+                saccades.append(Saccade(start, stop, start_x, start_y, end_x, end_y, amp, peak_vel))
                 continue
-            # Parse blink events e.g.
-            #   "EBLINK R 344176 344200 25"
-            m = re.match(
-                r'EBLINK (L|R)\s+(\d+)\s+(\d+)\s+(\d+)', line)
-            if m:
-                mgs = list(m.groups())
-                is_blink_event = False
-                event_flag = 'None'
-                start, stop, dur = map(float, mgs[1:])
-                # Map times to seconds
-                start /= 1000
-                stop /= 1000
-                dur /= 1000
+
+            # Parse blink events
+            if m := BLINK_RE.match(line):
+                start = float(m.group(2))/1000
+                stop = float(m.group(3))/1000
                 blinks.append(Blink(start, stop))
                 continue
-            # Parse gaze events "314631 958.8 551.2 1183.0 ..."
-            m = re.match(
-                r'(\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+).*\.\.\.', line)
-            if m:
-                onset_time, x_pos, y_pos, pupil = map(float, m.groups())
-                # Convert to seconds
-                onset_time /= 1000
-                gaze.append(
-                    Gaze(
-                        onset_time,
-                        x_pos,
-                        y_pos,
-                        is_fixation_event,
-                        is_saccade_event,
-                        is_blink_event,
-                        event_flag))
+
+            # Parse gaze events
+            if m := GAZE_RE.match(line):
+                onset_time = float(m.group(1))/1000
+                x_pos = float(m.group(2))
+                y_pos = float(m.group(3))
+                pupil = float(m.group(4))
+                gaze.append(Gaze(onset_time, x_pos, y_pos, pupil))
                 continue
+
     return trials
