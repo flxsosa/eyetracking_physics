@@ -322,7 +322,7 @@ class EyeLink(object):
         # Put the mouse back on the screen for future trials
         self.win.mouseVisible = True
 
-    def save_data(self, data_dir:str=None) -> None:
+    def save_data(self, data_dir:str=None, latin_square_seq:str=None, yes_button:str=None) -> None:
         """Save data from the eye tracker.
         
         Args:
@@ -332,17 +332,16 @@ class EyeLink(object):
         # Set up a folder to store the EDF data files and the associated
         # resources e.g., files defining the interest areas used in each trial
         if not data_dir:
-            data_dir = 'data/eyelink'
+            data_dir = 'data'
         if not os.path.exists(data_dir):
             os.makedirs(data_dir)
-        # Create a dir for the current testing session
-        session_dir = os.path.join(data_dir, self.uniqueid)
-        if not os.path.exists(session_dir):
-            os.makedirs(session_dir)
+        if not latin_square_seq:
+            latin_square_seq = 'A'
         # Download the EDF data file from the Host PC to a local data folder
         # NOTE: parameters are `source_file_on_the_host` and
         #   `destination_file_on_local_drive`
-        local_edf = os.path.join(session_dir,  'raw.edf')
+        local_edf_fname = self.edf_file.split('.')[0]+f'_{latin_square_seq}' + f'_{yes_button}.edf'
+        local_edf = os.path.join(data_dir,  local_edf_fname)
         logging.info('receiving eyelink data')
         # Saves the eye tracker file locally to your machine.
         self.tracker.receiveDataFile(self.edf_file, local_edf)
@@ -417,7 +416,7 @@ class MouseLink(EyeLink):
         logging.info('MouseLink calibrate')
         return
 
-    def save_data(self):
+    def save_data(self, data_dir, latin_square_seq):
         logging.info('MouseLink save_data')
         return
 
