@@ -11,6 +11,7 @@ MONITOR_DISTANCE = 70.0
 
 # Paths
 DATA_DIR = 'data'
+EXP1_DATA_DIR = 'data/experiment1'
 PILOT_DIR = 'data/pilots'
 INTRO_STIM_DIR = 'data/introduction'
 COMPREHENSION_STIM_DIR = 'data/comprehension'
@@ -27,3 +28,11 @@ YELLOW_BUTTON = 'space'
 DEFAULT_WIDTH = 800
 DEFAULT_HEIGHT = 1000
 STIM_SCALE = 0.98
+
+# Latin square sequences
+LAT_SQR_SEQS = {
+    'A': [0,1,2,3],
+    'B': [3,0,1,2],
+    'C': [2,3,0,1],
+    'D': [1,2,3,0],
+}
