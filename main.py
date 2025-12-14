@@ -4,6 +4,7 @@ import glob
 import os
 import json
 import random
+import uuid
 
 from psychopy import visual, monitors
 
@@ -34,6 +35,7 @@ def construct_experiment_section(
     Returns:
         experiment_trials: A list of trials that define the experiment section.
     """
+    fixation = trial.FixationTrial(win=win)
     # Each experiment section begins with an instruction slide
     experiment_trials = [
         trial.ImageTrial(
@@ -59,7 +61,7 @@ def construct_experiment_section(
                 win=win),
         ]
         # Append a fixation trial that preceds the experiment block
-        experiment_trials.append(trial.FixationTrial(win=win))
+        experiment_trials.append(fixation)
         # Append the video trials that constitute the experiment block
         experiment_trials.append(
             trial.ExperimentBlock(
@@ -108,6 +110,7 @@ def construct_comprehension_section_easy(
     Returns:
         comprehension_trials: A list of trials that define the comprehension.
     """
+    fixation = trial.FixationTrial(win=win)
     comprehension_trials = [
         trial.ImageTrial(
             win=win,
@@ -142,7 +145,7 @@ def construct_comprehension_section_easy(
         else:
             correct_response = no_button
         # Append a fixation trial that precedes the comprehension trials
-        comprehension_trials.append(trial.FixationTrial(win=win))
+        comprehension_trials.append(fixation)
         # Append the comprehension block
         comprehension_trials.append(
             trial.ComprehensionBlock(
@@ -200,6 +203,7 @@ def construct_comprehension_section_med(
     Returns:
         comprehension_trials: A list of trials that define the comprehension.
     """
+    fixation = trial.FixationTrial(win=win)
     comprehension_trials = [
         trial.ImageTrial(
             win=win,
@@ -234,7 +238,7 @@ def construct_comprehension_section_med(
         else:
             correct_response = no_button
         # Append a fixation trial that precedes the comprehension trials
-        comprehension_trials.append(trial.FixationTrial(win=win))
+        comprehension_trials.append(fixation)
         # Append the comprehension block
         comprehension_trials.append(
             trial.ComprehensionBlock(
@@ -292,6 +296,7 @@ def construct_comprehension_section_hard(
     Returns:
         comprehension_trials: A list of trials that define the comprehension.
     """
+    fixation = trial.FixationTrial(win=win)
     comprehension_trials = [
         trial.ImageTrial(
             win=win,
@@ -329,7 +334,7 @@ def construct_comprehension_section_hard(
         else:
             correct_response = no_button
         # Append a fixation trial that precedes the comprehension trials
-        comprehension_trials.append(trial.FixationTrial(win=win))
+        comprehension_trials.append(fixation)
         # Append the comprehension block
         comprehension_trials.append(
             trial.ComprehensionBlock(
@@ -365,7 +370,7 @@ def construct_comprehension_section_hard(
     return comprehension_trials
 
 
-def check_comprehension(trials:list[trial.Tria]) -> bool:
+def check_comprehension(trials:list[trial.Trial]) -> bool:
     """Determines whether the comprehension trials were passed.
     
     Args:
@@ -431,14 +436,19 @@ def main(mouse=True):
         units='pix',
         winType='pyglet',
         monitor=mon)
+    unique_id = str(uuid.uuid4())
     # Instatiate EyeLink
     if mouse:
         el = MouseLink(win=win, uniqueid='test', dummy_mode=False)
     else:
-        el = EyeLink(win=win, uniqueid='test')
+        el = EyeLink(win=win, uniqueid=unique_id)
     # Set up calibration trial
-    # el.calibrate()
     red_button = random.choice(['yes', 'no'])
+    if red_button == 'yes':
+        yes_button = config.RED_BUTTON
+    else:
+        yes_button = config.BLUE_BUTTON
+    latin_square_sequence = 'A'
     # Construct introduction phase
     introduction_block = [
         trial.ImageTrial(win=win, image_path='data/introduction/introduction_1.png'),
@@ -475,7 +485,8 @@ def main(mouse=True):
     for key in latin_square_stimuli:
         random.shuffle(latin_square_stimuli[key])
     experiment_section_0 = construct_experiment_section(
-        video_paths=latin_square_stimuli[0][:2],
+        video_paths=latin_square_stimuli[
+            config.LAT_SQR_SEQS[latin_square_sequence][0]],
         eyelink=el,
         win=win,
         red_button=red_button)
@@ -484,7 +495,8 @@ def main(mouse=True):
             win=win, image_path='data/introduction/experiment_section_end_0')
     )
     experiment_section_1 = construct_experiment_section(
-        video_paths=latin_square_stimuli[1][:2],
+        video_paths=latin_square_stimuli[
+            config.LAT_SQR_SEQS[latin_square_sequence][1]],
         eyelink=el,
         win=win,
         red_button=red_button)
@@ -493,7 +505,8 @@ def main(mouse=True):
             win=win, image_path='data/introduction/experiment_section_end_1')
     )
     experiment_section_2 = construct_experiment_section(
-        video_paths=latin_square_stimuli[2][:2],
+        video_paths=latin_square_stimuli[
+            config.LAT_SQR_SEQS[latin_square_sequence][2]],
         eyelink=el,
         win=win,
         red_button=red_button)
@@ -502,7 +515,8 @@ def main(mouse=True):
             win=win, image_path='data/introduction/experiment_section_end_2')
     )
     experiment_section_3 = construct_experiment_section(
-        video_paths=latin_square_stimuli[3][:2],
+        video_paths=latin_square_stimuli[
+            config.LAT_SQR_SEQS[latin_square_sequence][3]],
         eyelink=el,
         win=win,
         red_button=red_button)
@@ -510,7 +524,7 @@ def main(mouse=True):
         trial.ImageTrial(
             win=win, image_path='data/introduction/experiment_section_end_3')
     )
-
+    el.calibrate()
     # Introduction phase
     run_introduction_block(introduction_block)
     # Comprehension phase
@@ -526,7 +540,9 @@ def main(mouse=True):
         experiment_block.run()
     for experiment_block in experiment_section_3:
         experiment_block.run()
+    el.save_data(config.EXP1_DATA_DIR, latin_square_sequence)
+    el.close_connection()
 
 
 if __name__ == '__main__':
-    main(mouse=True)
+    main(mouse=False)
