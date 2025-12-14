@@ -38,7 +38,9 @@ class ImageTrial(Trial):
         self.image_stim = visual.ImageStim(
             win=self.win,
             image=image_path,
-            pos=(0,0)
+            pos=(0,0),
+            units='pix',
+            size=[1920,1080]
         )
 
     def draw(self) -> None:
@@ -204,7 +206,6 @@ class ExperimentBlock(Block):
         # Get participant response time
         response_time = time.time() - self.video_start_time
         # Send trial variable info
-        self.eyelink.message('!V TRIAL_VAR trial_index %d' % (self.id))
         self.eyelink.message('!V TRIAL_VAR scene_name %s' % (
             video.name))
         self.eyelink.message('!V TRIAL_VAR rt %f' % (response_time))
@@ -213,8 +214,9 @@ class ExperimentBlock(Block):
 
     def run(self) -> None:
         """Run forward the video trial."""
-        # Send trial onset message
+        # Send block onset message
         self.eyelink.message('BLOCK_START')
+        self.eyelink.message('!V TRIAL_VAR block_index %d' % (self.id))
         for trial_index, v in enumerate(self.videos):
             self.eyelink.message('TRIAL_START')
             self.eyelink.start_recording()
@@ -224,7 +226,6 @@ class ExperimentBlock(Block):
             self.responses[v.name] = {'response': v.response, 'rt': v.rt}
             self.eyelink.message('!V TRIAL_VAR trial_index %d' % (trial_index))
             self.eyelink.message('TRIAL_END')
-        self.eyelink.message('!V TRIAL_VAR block_index %d' % (self.id))
         self.eyelink.message('BLOCK_END')
         self.response_recorded.draw()
         self.response_recorded.win.flip()
@@ -273,18 +274,17 @@ class ComprehensionBlock(Block):
         # Get participant response time
         response_time = time.time() - self.video_start_time
         # Send trial variable info
-        self.eyelink.message('!V TRIAL_VAR trial_index %d' % (self.id))
         self.eyelink.message('!V TRIAL_VAR scene_name %s' % (
             video.name))
         self.eyelink.message('!V TRIAL_VAR rt %f' % (response_time))
         video.rt = response_time
-        event.clearEvents()
 
     def run(self) -> None:
         """Run forward the video trial."""
         # Send trial onset message
         self.eyelink.message('BLOCK_START')
-        for v in self.videos:
+        self.eyelink.message('!V TRIAL_VAR block_index %d' % (self.id))
+        for trial_index, v in enumerate(self.videos):
             self.eyelink.message('TRIAL_START')
             self.eyelink.start_recording()
             self.video_start_time = time.time()
@@ -293,6 +293,7 @@ class ComprehensionBlock(Block):
             self.responses[v.name] = {'response': v.response, 'rt': v.rt}
             if '_post' in v.name:
                 self.passed = self.correct_response == v.response
+            self.eyelink.message('!V TRIAL_VAR trial_index %d' % (trial_index))
             self.eyelink.message('TRIAL_END')
         # Send trial offset message
         self.eyelink.message('BLOCK_END')
