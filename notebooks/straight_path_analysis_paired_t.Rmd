@@ -1,0 +1,231 @@
+---
+title: "straight_path_analysis_paired_t"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Loads required packages and reads classified_trial_data.csv, a preprocessed dataset generated from notebooks/empirical_gaze_analysis.ipynb. 
+
+```{r}
+library(readr)
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+classified_trial_data <- read_csv(".../classified_trial_data.csv")
+
+drop_scenes <- c(
+  "med_nocol_nosp_1",
+  "high_yescol_yessp_1",
+  "high_nocol_nosp_2",
+  "high_nocol_yessp_1",
+  "high_yescol_yessp_4",
+  "high_nocol_yessp_2",
+  "high_yescol_yessp_3",
+  "low_yescol_nosp_2"
+)
+
+classified_trial_data <- classified_trial_data %>% filter(!scene_name %in% drop_scenes)
+
+classified_trial_data <- classified_trial_data %>%
+  dplyr::mutate(
+    normalized_time = as.numeric(normalized_time),
+    x = as.numeric(x),
+    y = as.numeric(y)
+  ) %>%
+  dplyr::group_by(scene_name, subject_id) %>%
+  dplyr::arrange(normalized_time, .by_group = TRUE) %>%
+  dplyr::mutate(
+    gaze_speed = sqrt((x - dplyr::lag(x))^2 + (y - dplyr::lag(y))^2),
+    gaze_speed = dplyr::if_else(
+      dplyr::row_number() == 1,
+      dplyr::lead(gaze_speed),
+      gaze_speed
+    )
+  ) %>%
+  dplyr::ungroup()
+classified_trial_data$pupil <- log(classified_trial_data$pupil)
+
+dfs <- classified_trial_data %>%
+  dplyr::group_by(subject_id) %>%
+  dplyr::group_split(.keep = TRUE)
+
+subject_names <- classified_trial_data %>%
+  dplyr::group_by(subject_id) %>%
+  dplyr::group_keys() %>%
+  dplyr::pull(subject_id)
+
+base::names(dfs) <- subject_names
+base::length(dfs)      
+base::names(dfs)   
+```
+
+
+
+For each subject, calculates condition-level summaries for straight-path and no-straight-path trials: mean gaze speed, proportion of saccades, and proportion of smooth pursuit. The results are reshaped into a wide table so each subject has paired values for both path conditions.
+
+
+```{r}
+library(dplyr)
+library(purrr)
+library(tidyr)
+
+if (is.null(names(dfs))) {
+  names(dfs) <- paste0("df", seq_along(dfs))
+}
+
+result_table <- imap_dfr(dfs, ~{
+  .x %>%
+    group_by(path_condition) %>%
+    summarise(
+      mean_gaze_speed = mean(gaze_speed, na.rm = TRUE),
+      prop_saccade = mean(segment_class == "saccade", na.rm = TRUE),
+      prop_smooth_pursuit = mean(segment_class == "smooth_pursuit", na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    filter(path_condition %in% c("no_straight_path", "straight_path")) %>%
+    mutate(dataframe_name = .y) %>%
+    pivot_wider(
+      names_from = path_condition,
+      values_from = c(mean_gaze_speed, prop_saccade, prop_smooth_pursuit)
+    )
+})
+
+```
+
+
+Creates a plotting dataset of within-subject condition differences, computes mean differences and standard errors, and defines a reusable violin-plot function. It generates three plots showing subject-level differences for gaze speed, saccade proportion, and smooth-pursuit proportion, then combines them into one labeled figure.
+
+
+```{r, fig.height=4, fig.width=12}
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+# Build plotting dataframe
+plot_df <- result_table %>%
+  transmute(
+    `gaze speed` = mean_gaze_speed_straight_path - mean_gaze_speed_no_straight_path,
+    `proportion of saccade` = prop_saccade_straight_path - prop_saccade_no_straight_path,
+    `proportion of smooth pursuit` = prop_smooth_pursuit_no_straight_path - prop_smooth_pursuit_straight_path
+  ) %>%
+  tidyr::pivot_longer(
+    cols = everything(),
+    names_to = "measure",
+    values_to = "diff"
+  )
+
+# Summary stats
+summary_df <- plot_df %>%
+  group_by(measure) %>%
+  summarise(
+    mean_diff = mean(diff, na.rm = TRUE),
+    se = sd(diff, na.rm = TRUE) / sqrt(sum(!is.na(diff))),
+    .groups = "drop"
+  )
+
+# Reusable plotting function
+make_violin <- function(measure_name, fill_color, ylab_text) {
+  ggplot(
+    dplyr::filter(plot_df, measure == measure_name),
+    aes(x = measure, y = diff, fill = measure)
+  ) +
+    geom_violin(trim = FALSE, alpha = 0.8, color = NA) +
+    geom_jitter(width = 0.08, size = 1.8, alpha = 0.5, color = "black") +
+    geom_point(
+      data = dplyr::filter(summary_df, measure == measure_name),
+      aes(x = measure, y = mean_diff),
+      inherit.aes = FALSE,
+      size = 2.5
+    ) +
+    geom_errorbar(
+      data = dplyr::filter(summary_df, measure == measure_name),
+      aes(
+        x = measure,
+        ymin = mean_diff - se,
+        ymax = mean_diff + se
+      ),
+      inherit.aes = FALSE,
+      width = 0.12,
+      size = 0.7
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    scale_fill_manual(values = setNames(fill_color, measure_name)) +
+    labs(
+      x = NULL,
+      y = ylab_text
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      axis.text.x = element_text(size = 16),
+      legend.position = "none"
+    )
+}
+
+p1 <- make_violin(
+  measure_name = "gaze speed",
+  fill_color = "#40BCD8",
+  ylab_text = "within-subject difference\n(straight path - no straight path)"
+)
+
+p2 <- make_violin(
+  measure_name = "proportion of saccade",
+  fill_color = "coral",
+  ylab_text = "within-subject difference\n(straight path - no straight path)"
+)
+
+p3 <- make_violin(
+  measure_name = "proportion of smooth pursuit",
+  fill_color = "lightgreen",
+  ylab_text = "within-subject difference\n(no straight path - straight path)"
+)
+
+p <- p1 + p2 + p3 +
+  patchwork::plot_annotation(tag_levels = list(c("(a)", "(b)", "(c)")))
+```
+
+
+
+
+
+
+Runs paired t-tests comparing no-straight-path versus straight-path conditions for mean gaze speed, saccade proportion, and smooth-pursuit proportion. The test outputs are printed to evaluate whether the within-subject differences are statistically reliable.
+
+```{r}
+t_mean_gaze_speed <- t.test(
+  result_table$mean_gaze_speed_no_straight_path,
+  result_table$mean_gaze_speed_straight_path,
+  paired = TRUE
+)
+
+t_prop_saccade <- t.test(
+  result_table$prop_saccade_no_straight_path,
+  result_table$prop_saccade_straight_path,
+  paired = TRUE
+)
+
+t_prop_smooth_pursuit <- t.test(
+  result_table$prop_smooth_pursuit_no_straight_path,
+  result_table$prop_smooth_pursuit_straight_path,
+  paired = TRUE
+)
+
+t_mean_gaze_speed
+t_prop_saccade
+t_prop_smooth_pursuit
+```
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,1480 @@
+---
+title: "abs_vs_sim_eye_tracking_analysis"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+
+Loads required packages and reads model_predictions.csv, a preprocessed dataset generated from notebooks/empirical_gaze_analysis.ipynb. 
+
+```{r}
+library(readr)
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+model_predictions <- read_csv(".../model_predictions.csv")
+
+scene_to_screen_coordinates <- function(scene_x, scene_y,
+                                        scene_x_lim = 800, scene_y_lim = 1000,
+                                        screen_x_lim = 1920, screen_y_lim = 1080) {
+  converted_x <- screen_x_lim / 2 - scene_x_lim / 2 + scene_x
+  converted_y <- screen_y_lim / 2 - scene_y_lim / 2 + scene_y
+  c(converted_x, converted_y)
+}
+
+blended_model_data <- within(model_predictions, {
+  x <- 1920/2 - 800/2 + x
+  y <- 1080/2 - 1000/2 + y
+})
+
+names(blended_model_data)[names(blended_model_data) == "segment_class"] <- "reasoning_trace"
+```
+
+Creates start and end coordinates for each model segment, so abstraction and simulation traces can be treated as line segments rather than isolated points.
+
+```{r}
+library(dplyr)
+
+test <- blended_model_data %>%
+  group_by(scene_name, sample_idx) %>%
+  mutate(
+    start_x = if_else(
+      reasoning_trace %in% c("abstraction", "simulation"),
+      lag(x, n = 1),
+      x
+    ),
+    start_y = if_else(
+      reasoning_trace %in% c("abstraction", "simulation"),
+      lag(y, n = 1),
+      y
+    ),
+    end_x = x,
+    end_y = y
+  ) %>%
+  ungroup()
+
+```
+
+
+
+
+
+
+# Preprocessing: Make simulation segments visible
+
+Splits the first abstraction segment after each simulation point, relabeling the first 20% as simulation. This makes short simulation traces easier to visualize.
+
+```{r}
+library(dplyr)
+split_frac <- 0.20  # 20%
+
+test <- blended_model_data %>%
+  group_by(scene_name, sample_idx) %>%
+  mutate(
+    row_id     = row_number(),
+    prev_trace = lag(reasoning_trace),
+
+    # build segments (prev point -> current point) for the two traces
+    start_x = if_else(reasoning_trace %in% c("abstraction", "simulation"), lag(x), x),
+    start_y = if_else(reasoning_trace %in% c("abstraction", "simulation"), lag(y), y),
+    end_x   = x,
+    end_y   = y
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # identify "start of abstraction segment right after simulation"
+    is_split = reasoning_trace == "abstraction" & prev_trace == "simulation" &
+               !is.na(start_x) & !is.na(start_y),
+
+    # point that is 20% along the abstraction segment (from start -> end)
+    mid_x = start_x + split_frac * (end_x - start_x),
+    mid_y = start_y + split_frac * (end_y - start_y)
+  )
+
+# Build the new, split dataset:
+test <- bind_rows(
+  # rows that are not split
+  test %>%
+    filter(!is_split) %>%
+    mutate(row_id2 = row_id),
+
+  # the new "simulation" piece: start -> mid (20%)
+  test %>%
+    filter(is_split) %>%
+    mutate(
+      reasoning_trace = "simulation",
+      end_x = mid_x, end_y = mid_y,
+      row_id2 = row_id + 0.1
+    ),
+
+  # the remaining "abstraction" piece: mid -> end (80%)
+  test %>%
+    filter(is_split) %>%
+    mutate(
+      start_x = mid_x, start_y = mid_y,
+      row_id2 = row_id + 0.2
+    )
+) %>%
+  arrange(scene_name, sample_idx, row_id2) %>%
+  dplyr::select(-row_id2, -prev_trace, -is_split, -mid_x, -mid_y)
+
+```
+
+
+# Segment-based matching
+
+Instead of matching to every interpolated point, we match human data to each model segment (abstraction or simulation).
+
+For each model segment, we collect human points that satisfy both:
+
+1. Within the segment’s y-range: $y \in \left[\min(\mathrm{start\_y}, \mathrm{end\_y}),\ \max(\mathrm{start\_y}, \mathrm{end\_y})\right]$;
+
+2. Close to the segment: point-to-segment distance $\le \mathrm{dist\_thresh}$ (perpendicular distance $\le 20$).
+
+This avoids repeatedly reusing the same human samples across many nearby model points, while still aligning eye-tracking data to the model’s predicted trace.
+
+
+
+# Scene filtering
+
+Reads classified_trial_data.csv, a preprocessed dataset generated from notebooks/empirical_gaze_analysis.ipynb. 
+
+
+```{r}
+classified_trial_data <- read_csv(".../classified_trial_data.csv")
+```
+
+Removes scenes where the model trace is physically implausible or shows problematic abstraction patterns.
+
+
+```{r}
+library(dplyr)
+
+drop_scenes <- c(
+  "med_nocol_nosp_1",
+  "high_yescol_yessp_1",
+  "high_nocol_nosp_2",
+  "high_nocol_yessp_1",
+  "high_yescol_yessp_4",
+  "high_nocol_yessp_2",
+  "high_yescol_yessp_3",
+  "low_yescol_nosp_2"
+)
+
+test <- test %>% filter(!scene_name %in% drop_scenes)
+classified_trial_data <- classified_trial_data %>% filter(!scene_name %in% drop_scenes)
+```
+
+Converts gaze variables to numeric values, computes gaze speed within each subject and scene, and log-transforms pupil size.
+
+
+```{r}
+classified_trial_data <- classified_trial_data %>%
+  dplyr::mutate(
+    normalized_time = as.numeric(normalized_time),
+    x = as.numeric(x),
+    y = as.numeric(y)
+  ) %>%
+  dplyr::group_by(scene_name, subject_id) %>%
+  dplyr::arrange(normalized_time, .by_group = TRUE) %>%
+  dplyr::mutate(
+    gaze_speed = sqrt((x - dplyr::lag(x))^2 + (y - dplyr::lag(y))^2),
+    gaze_speed = dplyr::if_else(
+      dplyr::row_number() == 1,
+      dplyr::lead(gaze_speed),
+      gaze_speed
+    )
+  ) %>%
+  dplyr::ungroup()
+classified_trial_data$pupil <- log(classified_trial_data$pupil)
+```
+
+
+
+Splits the human eye-tracking dataset into one dataframe per subject for subject-level analyses.
+
+```{r,results='hide'}
+dfs <- classified_trial_data %>%
+  dplyr::group_by(subject_id) %>%
+  dplyr::group_split(.keep = TRUE)
+
+subject_names <- classified_trial_data %>%
+  dplyr::group_by(subject_id) %>%
+  dplyr::group_keys() %>%
+  dplyr::pull(subject_id)
+
+base::names(dfs) <- subject_names
+base::length(dfs)      
+base::names(dfs)   
+```
+
+
+Prints the number of Experiment 1 and Experiment 2 scenes available for each participant.
+
+```{r}
+for (nm in names(dfs)) {
+  scene_names <- unique(dfs[[nm]]$scene_name)
+
+  n_starts_scene <- sum(grepl("^scene", scene_names))
+  n_not_starts_scene <- sum(!grepl("^scene", scene_names))
+
+  cat(
+    nm, ":",
+    n_not_starts_scene, "scenes in Exp 1,",
+    n_starts_scene, "scenes in Exp 2\n"
+  )
+}
+```
+
+
+# Saccade and smooth pursuit probabilities during abstraction vs simulation
+
+Matches human gaze points to nearby abstraction or simulation model segments using y-range filtering and point-to-segment distance. For each matched segment, it counts saccades, smooth pursuits, fixations, and PSOs.
+
+```{r, cache=TRUE}
+point_to_segment_dist <- function(px, py, ax, ay, bx, by) {
+  # returns distance from point P(px,py) to segment AB(ax,ay)-(bx,by)
+  abx <- bx - ax
+  aby <- by - ay
+  apx <- px - ax
+  apy <- py - ay
+
+  denom <- abx^2 + aby^2
+
+  # handle zero-length segments (A == B)
+  t <- ifelse(denom == 0, 0, (apx * abx + apy * aby) / denom)
+  t <- pmin(1, pmax(0, t))
+
+  cx <- ax + t * abx
+  cy <- ay + t * aby
+
+  sqrt((px - cx)^2 + (py - cy)^2)
+}
+
+library(dplyr)
+library(tibble)
+
+results_prop_by_subject <- list()
+
+dist_thresh <- 20  # perpendicular distance threshold (pixels, same scale as x/y)
+
+n_subjects <- length(dfs)
+counter <- 0
+
+for (subject_id in names(dfs)) {
+
+  counter <- counter + 1
+  message("[", counter, "/", n_subjects, "] Processing subject: ", subject_id)
+
+  classified_subject <- dfs[[subject_id]]
+  results_prop_list <- list()
+
+  for (scene in unique(test$scene_name)) {
+
+    # --- model segments for this scene (abstraction/simulation only)
+    segs <- test %>%
+      filter(scene_name == scene,
+             reasoning_trace %in% c("abstraction", "simulation")) %>%
+      dplyr::select(scene_name, reasoning_trace, start_x, start_y, end_x, end_y)
+
+    # --- human points for this scene
+    human <- classified_subject %>%
+      filter(scene_name == scene) %>%
+      dplyr::select(scene_name, x, y, segment_class)
+
+    if (nrow(segs) == 0 || nrow(human) == 0) {
+      results_prop_list[[scene]] <- NULL
+      next
+    }
+
+    rows <- vector("list", nrow(segs))
+    keep <- 0
+
+    # loop over model segments
+    for (i in seq_len(nrow(segs))) {
+
+      ax <- segs$start_x[i]; ay <- segs$start_y[i]
+      bx <- segs$end_x[i];   by <- segs$end_y[i]
+
+      # skip if any endpoints missing/non-finite
+      if (!is.finite(ax) || !is.finite(ay) || !is.finite(bx) || !is.finite(by)) next
+
+      # 1) filter by y-range of the segment
+      y_lo <- min(ay, by)
+      y_hi <- max(ay, by)
+      cand <- human %>% filter(y >= y_lo, y <= y_hi)
+
+      if (nrow(cand) == 0) next
+
+      # 2) perpendicular distance to segment
+      d <- point_to_segment_dist(cand$x, cand$y, ax, ay, bx, by)
+      nearby <- cand[d <= dist_thresh, , drop = FALSE]
+
+      if (nrow(nearby) == 0) next
+
+      keep <- keep + 1
+      rows[[keep]] <- tibble(
+        scene_name      = scene,
+        reasoning_trace = segs$reasoning_trace[i],
+        start_x = ax, start_y = ay,
+        end_x   = bx, end_y   = by,
+
+        n_within_1      = nrow(nearby),
+        n_smooth_pursuit = sum(nearby$segment_class == "smooth_pursuit", na.rm = TRUE),
+        n_saccade        = sum(nearby$segment_class == "saccade",        na.rm = TRUE),
+        n_fixation       = sum(nearby$segment_class == "fixation",       na.rm = TRUE),
+        n_pso            = sum(nearby$segment_class == "pso",            na.rm = TRUE)
+      )
+    }
+
+    if (keep == 0) {
+      results_prop_list[[scene]] <- NULL
+      next
+    }
+
+    results_prop_list[[scene]] <- bind_rows(rows[seq_len(keep)]) %>%
+      mutate(
+        prop_smooth   = n_smooth_pursuit / n_within_1,
+        prop_saccade  = n_saccade / n_within_1,
+        prop_fixation = n_fixation / n_within_1,
+        prop_pso      = n_pso / n_within_1
+      )
+  }
+
+  results_prop_by_subject[[subject_id]] <- results_prop_list
+  message("Completed subject: ", subject_id, "\n")
+}
+
+```
+
+For each participant, calculates mean saccade and smooth-pursuit proportions during abstraction and simulation.
+
+```{r}
+results_summary_by_subject <- list()
+
+for (subject_id in names(results_prop_by_subject)) {
+
+  scene_list <- results_prop_by_subject[[subject_id]]
+
+  # Combine all scenes for this participant
+  df_all <- purrr::map_dfr(
+    scene_list,
+    function(x) {
+      if (is.null(x) || nrow(x) == 0) return(NULL)
+      x
+    }
+  )
+
+  # If no valid data, skip
+  if (nrow(df_all) == 0) {
+    results_summary_by_subject[[subject_id]] <- NULL
+    next
+  }
+
+  # Keep only abstraction / simulation
+  df_all <- df_all %>%
+    dplyr::filter(reasoning_trace %in% c("abstraction", "simulation"))
+
+  # If one of the groups is missing, still compute what exists
+  summary_df <- df_all %>%
+    dplyr::group_by(reasoning_trace) %>%
+    dplyr::summarise(
+      mean_prop_saccade = mean(prop_saccade, na.rm = TRUE),
+      mean_prop_smooth  = mean(prop_smooth,  na.rm = TRUE),
+      n_model_point     = dplyr::n(),
+      .groups = "drop"
+    ) %>%
+    # Ensure both rows exist
+    dplyr::right_join(
+      tibble::tibble(reasoning_trace = c("abstraction", "simulation")),
+      by = "reasoning_trace"
+    )
+
+  results_summary_by_subject[[subject_id]] <- summary_df
+}
+
+```
+
+Creates a wide subject-level table with separate abstraction and simulation columns for saccade and smooth-pursuit proportions.
+
+```{r}
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(tibble)
+
+summary_wide_by_subject <- purrr::imap_dfr(
+  results_prop_by_subject,
+  function(scene_list, subject_id) {
+
+    df_all <- purrr::map_dfr(
+      scene_list,
+      function(x) {
+        if (is.null(x) || nrow(x) == 0) return(NULL)
+        x
+      }
+    )
+
+    if (nrow(df_all) == 0) return(NULL)
+
+    df_all <- df_all %>%
+      dplyr::filter(reasoning_trace %in% c("abstraction", "simulation"))
+
+    summary_df <- df_all %>%
+      dplyr::group_by(reasoning_trace) %>%
+      dplyr::summarise(
+        mean_prop_saccade = mean(prop_saccade, na.rm = TRUE),
+        mean_prop_smooth  = mean(prop_smooth, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      dplyr::right_join(
+        tibble::tibble(reasoning_trace = c("abstraction", "simulation")),
+        by = "reasoning_trace"
+      ) %>%
+      tidyr::pivot_wider(
+        names_from = reasoning_trace,
+        values_from = c(mean_prop_saccade, mean_prop_smooth)
+      ) %>%
+      dplyr::mutate(subject_id = subject_id, .before = 1)
+
+    summary_df
+  }
+)
+
+summary_wide_by_subject
+```
+
+
+
+
+Aggregates results across participants and reports average saccade and smooth-pursuit proportions for abstraction versus simulation.
+
+```{r}
+group_level_summary <- purrr::map_dfr(
+  results_summary_by_subject,
+  function(df) {
+    if (is.null(df) || nrow(df) == 0) return(NULL)
+    df
+  },
+  .id = "subject_id"
+) %>%
+  dplyr::group_by(reasoning_trace) %>%
+  dplyr::summarise(
+    avg_mean_prop_saccade = mean(mean_prop_saccade, na.rm = TRUE),
+    avg_mean_prop_smooth  = mean(mean_prop_smooth,  na.rm = TRUE),
+    n_subjects            = sum(!is.na(mean_prop_saccade) | !is.na(mean_prop_smooth)),
+    .groups = "drop"
+  )
+knitr::kable(group_level_summary)
+```
+
+
+
+### Statistical analysis
+
+
+Combines segment-level results across subjects and scenes, then prepares variables for statistical analysis of saccade versus smooth-pursuit differences.
+
+
+```{r}
+library(dplyr)
+library(purrr)
+
+combined_df <- imap_dfr(results_prop_by_subject, function(subject_list, subject_id) {
+
+  imap_dfr(subject_list, function(df, scene_id) {
+
+    if (!is.data.frame(df)) return(NULL)
+
+    df %>%
+      select(n_saccade, n_smooth_pursuit, prop_smooth, prop_saccade, reasoning_trace) %>%
+      mutate(
+        subject_id = subject_id,
+        scene_id   = scene_id,
+        prop_diff  = prop_saccade - prop_smooth,
+        reasoning_trace = factor(
+          ifelse(reasoning_trace == "abstraction", 1, 0),
+          levels = c(0, 1),
+          labels = c("simulation", "abstraction")
+        )
+      )
+  })
+})
+
+```
+
+
+#### Logit difference
+
+
+Computes the log-odds difference between saccade and smooth pursuit, then fits a mixed-effects model testing whether this difference changes between simulation and abstraction.
+
+The log odds ratio of saccades vs. smooth pursuit:
+
+- logit_diff = 0: equal odds;
+
+- logit_diff > 0: higher odds of saccades;
+
+- logit_diff < 0: higher odds of smooth pursuit.
+
+
+
+```{r}
+logit <- function(p) log(p / (1 - p))
+epsilon <- 1e-5
+
+combined_df <- combined_df %>%
+  mutate(
+    logit_saccade = logit(pmin(pmax(prop_saccade, epsilon), 1 - epsilon)),
+    logit_smooth  = logit(pmin(pmax(prop_smooth,  epsilon), 1 - epsilon)),
+    logit_diff    = logit_saccade - logit_smooth
+  )
+
+library(lme4)
+library(lmerTest)
+
+model_ld <- lmer(
+  logit_diff ~ reasoning_trace + (1 + reasoning_trace | subject_id),
+  data = combined_df
+)
+
+summary(model_ld)
+```
+
+
+
+
+
+
+
+
+
+
+Creates a multi-panel figure showing model traces, gaze-density patterns, segment-level logit differences, and group-level movement proportions.
+
+```{r, fig.height=3.5, fig.width=16}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(gridExtra)
+library(grid)
+library(png)
+library(readr)
+library(ggnewscale)
+
+# =========================================================
+# (a) Group-level bar plot
+# =========================================================
+group_level_summary_sem <- purrr::map_dfr(
+  results_summary_by_subject,
+  function(df) {
+    if (is.null(df) || nrow(df) == 0) return(NULL)
+    df
+  },
+  .id = "subject_id"
+) %>%
+  dplyr::filter(reasoning_trace %in% c("abstraction", "simulation")) %>%
+  tidyr::pivot_longer(
+    cols = c(mean_prop_saccade, mean_prop_smooth),
+    names_to = "movement",
+    values_to = "value"
+  ) %>%
+  dplyr::mutate(
+    condition = dplyr::recode(
+      reasoning_trace,
+      abstraction = "Abstraction",
+      simulation  = "Simulation"
+    ),
+    movement = dplyr::recode(
+      movement,
+      mean_prop_saccade = "Saccade",
+      mean_prop_smooth  = "Smooth pursuit"
+    )
+  ) %>%
+  dplyr::group_by(movement, condition) %>%
+  dplyr::summarise(
+    mean_value = mean(value, na.rm = TRUE),
+    sd_value   = sd(value, na.rm = TRUE),
+    n_subjects = sum(!is.na(value)),
+    sem_value  = sd_value / sqrt(n_subjects),
+    .groups = "drop"
+  )
+
+p_bar <- ggplot(
+  group_level_summary_sem,
+  aes(x = condition, y = mean_value, fill = condition)
+) +
+  geom_col(width = 0.6) +
+  geom_errorbar(
+    aes(
+      ymin = mean_value - sem_value,
+      ymax = mean_value + sem_value
+    ),
+    width = 0.2
+  ) +
+  facet_wrap(~ movement, nrow = 1) +
+  scale_fill_manual(
+    values = c(
+      "Abstraction" = "coral",
+      "Simulation"  = "lightgreen"
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = "Average mean proportion (± SEM)",
+    fill = NULL,
+    title = " ",
+    tag = "(d)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(size = 9, angle = 30, hjust = 1),
+    axis.text.y = element_text(size = 9),
+    axis.title.y = element_text(size = 10),
+    strip.text = element_text(size = 10),
+    plot.tag = element_text(face = "plain"),
+    plot.tag.position = c(0, 1)
+  )
+
+# =========================================================
+# Scene plots
+# =========================================================
+scene <- "high_yescol_nosp_1"
+scene_image_dir <- ".../intuitive_physics/eyetracking_physics-master/data/scene_images"
+
+xmin <- 560; xmax <- 1360
+ymin <- 40;  ymax <- 1040
+
+scene_seg_stats <- purrr::imap_dfr(results_prop_by_subject, function(scene_list, subject_id) {
+  df <- scene_list[[scene]]
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+
+  df %>%
+    dplyr::mutate(
+      subject_id = subject_id,
+      logit_saccade = logit(pmin(pmax(prop_saccade, epsilon), 1 - epsilon)),
+      logit_smooth  = logit(pmin(pmax(prop_smooth,  epsilon), 1 - epsilon)),
+      logit_diff    = logit_saccade - logit_smooth
+    ) %>%
+    dplyr::select(
+      scene_name, reasoning_trace,
+      start_x, start_y, end_x, end_y,
+      logit_diff, subject_id
+    )
+})
+
+seg_mean_sacc <- scene_seg_stats %>%
+  dplyr::filter(!is.na(logit_diff)) %>%
+  dplyr::group_by(scene_name, reasoning_trace, start_x, start_y, end_x, end_y) %>%
+  dplyr::summarise(
+    mean_logit_diff = mean(logit_diff, na.rm = TRUE),
+    n_subjects = dplyr::n_distinct(subject_id),
+    .groups = "drop"
+  )
+
+plot_df1 <- test %>%
+  dplyr::filter(
+    scene_name == scene,
+    reasoning_trace %in% c("abstraction", "simulation")
+  ) %>%
+  dplyr::select(scene_name, reasoning_trace, start_x, start_y, end_x, end_y) %>%
+  dplyr::left_join(
+    seg_mean_sacc,
+    by = c("scene_name", "reasoning_trace", "start_x", "start_y", "end_x", "end_y")
+  )
+
+plot_df2 <- test %>%
+  dplyr::filter(
+    scene_name == scene,
+    reasoning_trace %in% c("abstraction", "simulation")
+  )
+
+img_path <- base::file.path(scene_image_dir, paste0(scene, ".png"))
+bg_img <- png::readPNG(img_path)
+
+base_scene_plot <- ggplot2::ggplot() +
+  ggplot2::annotation_raster(
+    bg_img,
+    xmin = xmin, xmax = xmax,
+    ymin = ymin, ymax = ymax
+  ) +
+  ggplot2::coord_equal(
+    xlim = c(xmin, xmax),
+    ylim = c(ymin, ymax),
+    expand = FALSE
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(
+    aspect.ratio = (ymax - ymin) / (xmax - xmin)
+  )
+
+# (b) previous plot 1
+lim <- max(abs(plot_df1$mean_logit_diff), na.rm = TRUE)
+
+p1 <- base_scene_plot +
+  ggplot2::geom_segment(
+    data = plot_df1,
+    ggplot2::aes(
+      x = start_x, y = 1080 - start_y,
+      xend = end_x, yend = 1080 - end_y,
+      color = mean_logit_diff
+    ),
+    linewidth = 0.7, alpha = 0.9, lineend = "round"
+  ) +
+  ggplot2::scale_color_gradientn(
+    colors = c("darkgreen", "lightgreen", "coral"),
+    limits = c(0, lim),
+    oob = scales::squish,
+    name = "Mean logit\nsaccade - smooth",
+    guide = ggplot2::guide_colorbar(reverse = FALSE)
+  ) +
+  ggplot2::labs(
+    x = NULL, y = NULL,
+    title = " ",
+    tag = "(c)"
+  ) +
+  ggplot2::theme(
+    plot.tag = element_text(size = 14, face = "plain"),
+    plot.tag.position = c(0, 1),
+    plot.margin = margin(0, 0, 0, 0)
+  )
+
+# previous plot 2
+p2 <- base_scene_plot +
+  ggplot2::geom_segment(
+    data = plot_df2,
+    ggplot2::aes(
+      x = start_x, y = 1080 - start_y,
+      xend = end_x, yend = 1080 - end_y,
+      color = reasoning_trace
+    ),
+    linewidth = 0.6, alpha = 0.8, lineend = "round"
+  ) +
+  ggplot2::geom_point(
+    data = plot_df2,
+    ggplot2::aes(
+      x = end_x, y = 1080 - end_y,
+      color = reasoning_trace
+    ),
+    size = 1.2, alpha = 0.9
+  ) +
+  ggplot2::scale_color_manual(
+    values = c(abstraction = "coral", simulation = "lightgreen"),
+    breaks = c("abstraction", "simulation"),
+    labels = c("Abstraction", "Simulation")
+  ) +
+  ggplot2::labs(
+    x = NULL, y = NULL,
+    color = NULL,
+    title = NULL,
+    tag = "(a)"
+  ) +
+  ggplot2::guides(
+    color = ggplot2::guide_legend(
+      override.aes = list(
+        linewidth = 2,
+        alpha = 1
+      )
+    )
+  ) +
+  ggplot2::theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.03, 0.97),
+    legend.justification = c(0, 1),
+    legend.background = ggplot2::element_rect(
+      fill = scales::alpha("white", 0.7),
+      color = NA
+    ),
+    plot.title = ggplot2::element_blank(),
+    plot.tag = element_text(size = 14, face = "plain"),
+    plot.tag.position = c(0, 1),
+    plot.margin = margin(0, 0, 0, 0)
+  )
+# =========================================================
+# (d) Gaze-density plot
+# =========================================================
+classified_trial_data <- readr::read_csv(
+  ".../classified_trial_data.csv"
+)
+
+get_mode_first <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+mean_segment_gaze_data <- classified_trial_data %>%
+  dplyr::mutate(
+    x_int = if ("x_int" %in% names(.)) x_int else as.integer(round(x)),
+    y_int = if ("y_int" %in% names(.)) y_int else as.integer(round(y))
+  ) %>%
+  dplyr::group_by(scene_name, normalized_time) %>%
+  dplyr::summarise(
+    x_int = mean(x_int, na.rm = TRUE),
+    y_int = mean(y_int, na.rm = TRUE),
+    segment_class = get_mode_first(segment_class),
+    pupil = mean(pupil, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+scene_gaze_data <- mean_segment_gaze_data %>%
+  dplyr::filter(
+    scene_name == scene,
+    segment_class %in% c("saccade", "smooth_pursuit")
+  ) %>%
+  dplyr::mutate(
+    y_plot = 1080 - y_int
+  )
+
+legend_df <- tibble::tibble(
+  segment_class = c("saccade", "smooth_pursuit"),
+  x = c(NA_real_, NA_real_),
+  y = c(NA_real_, NA_real_)
+)
+
+p3 <- base_scene_plot +
+  stat_bin_2d(
+    data = scene_gaze_data %>% dplyr::filter(segment_class == "saccade"),
+    aes(x = x_int, y = y_plot, fill = after_stat(count)),
+    bins = 40,
+    alpha = 0.85
+  ) +
+  scale_fill_gradient(
+    low = "#FFD6CC",
+    high = "coral",
+    na.value = "transparent",
+    guide = "none"
+  ) +
+  ggnewscale::new_scale_fill() +
+  stat_bin_2d(
+    data = scene_gaze_data %>% dplyr::filter(segment_class == "smooth_pursuit"),
+    aes(x = x_int, y = y_plot, fill = after_stat(count)),
+    bins = 40,
+    alpha = 0.85
+  ) +
+  scale_fill_gradient(
+    low = "#CFECCF",
+    high = "green3",
+    na.value = "transparent",
+    guide = "none"
+  ) +
+  geom_point(
+    data = legend_df,
+    aes(x = x, y = y, color = segment_class),
+    shape = 15,
+    size = 4
+  ) +
+  scale_color_manual(
+    values = c(
+      "saccade" = "coral",
+      "smooth_pursuit" = "green3"
+    ),
+    labels = c(
+      "saccade" = "Saccade",
+      "smooth_pursuit" = "Smooth pursuit"
+    ),
+    name = NULL
+  ) +
+  guides(
+    color = guide_legend(
+      override.aes = list(shape = 15, size = 5, alpha = 1)
+    )
+  ) +
+  labs(
+    x = NULL, y = NULL,
+    title = " ",
+    tag = "(b)"
+  ) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.03, 0.97),
+    legend.justification = c(0, 1),
+    legend.background = ggplot2::element_rect(
+      fill = scales::alpha("white", 0.7),
+      color = NA
+    ),
+    plot.tag = element_text(size = 14, face = "plain"),
+    plot.tag.position = c(0, 1),
+    plot.margin = margin(0, 0, 0, 0)
+  )
+# =========================================================
+# Arrange plots
+# =========================================================
+g_bar <- ggplotGrob(p_bar)
+g1 <- ggplotGrob(p2)
+g2 <- ggplotGrob(p1)
+g3 <- ggplotGrob(p3)
+
+# make scene plots identical in panel/axis/legend layout
+common_widths  <- unit.pmax(g1$widths,  g2$widths,  g3$widths)
+common_heights <- unit.pmax(g1$heights, g2$heights, g3$heights)
+
+g1$widths  <- common_widths
+g2$widths  <- common_widths
+g3$widths  <- common_widths
+
+g1$heights <- common_heights
+g2$heights <- common_heights
+g3$heights <- common_heights
+
+
+# =========================================================
+# Display all four in one row
+# =========================================================
+
+blank <- nullGrob()   # or rectGrob(gp = gpar(col = NA, fill = NA))
+
+
+g_bar_short <- arrangeGrob(
+  nullGrob(),
+  g_bar,
+  nullGrob(),
+  ncol = 1,
+  heights = c(0.06, 0.88, 0.06)
+)
+
+library(grid)
+library(gridExtra)
+
+combined_figure <- arrangeGrob(
+  blank, g1, g3, g2, blank, g_bar_short,
+  ncol = 6,
+  widths = c(0.2, 1, 1, 1, 0.1, 0.8)
+)
+
+grid.newpage()
+grid.draw(combined_figure)
+```
+
+
+
+
+
+
+
+
+
+#  Log pupil size difference during abstraction vs simulation
+
+
+Repeats segment-based matching, but this time extracts mean pupil size, overall gaze speed, and saccade-only gaze speed for each matched model segment.
+
+```{r, cache=TRUE}
+library(dplyr)
+library(tibble)
+
+point_to_segment_dist <- function(px, py, ax, ay, bx, by) {
+  abx <- bx - ax
+  aby <- by - ay
+  apx <- px - ax
+  apy <- py - ay
+
+  denom <- abx^2 + aby^2
+  t <- ifelse(denom == 0, 0, (apx * abx + apy * aby) / denom)
+  t <- pmin(1, pmax(0, t))
+
+  cx <- ax + t * abx
+  cy <- ay + t * aby
+
+  sqrt((px - cx)^2 + (py - cy)^2)
+}
+
+results_prop_by_subject <- list()
+
+dist_thresh <- 20  # perpendicular distance threshold (px)
+
+n_subjects <- length(dfs)
+counter <- 0
+
+for (subject_id in names(dfs)) {
+
+  counter <- counter + 1
+  message("[", counter, "/", n_subjects, "] Processing subject: ", subject_id)
+
+  classified_subject <- dfs[[subject_id]]
+  results_prop_list <- list()
+
+  for (scene in unique(test$scene_name)) {
+
+    # Model segments (from `test`)
+    segs <- test %>%
+      filter(scene_name == scene) %>%
+      select(scene_name, reasoning_trace, start_x, start_y, end_x, end_y)
+
+    # Human points
+    classified_1 <- classified_subject %>%
+      filter(scene_name == scene) %>%
+      select(x, y, pupil, gaze_speed, segment_class)
+
+    if (nrow(segs) == 0 || nrow(classified_1) == 0) {
+      results_prop_list[[scene]] <- NULL
+      next
+    }
+
+    rows <- vector("list", nrow(segs))
+    keep <- 0
+
+    for (i in seq_len(nrow(segs))) {
+
+      ax <- segs$start_x[i]; ay <- segs$start_y[i]
+      bx <- segs$end_x[i];   by <- segs$end_y[i]
+
+      if (!is.finite(ax) || !is.finite(ay) || !is.finite(bx) || !is.finite(by)) next
+
+      # 1) y-range filter only
+      y_lo <- min(ay, by)
+      y_hi <- max(ay, by)
+
+      cand <- classified_1 %>%
+        filter(y >= y_lo, y <= y_hi)
+
+      if (nrow(cand) == 0) next
+
+      # 2) perpendicular distance filter
+      d <- point_to_segment_dist(cand$x, cand$y, ax, ay, bx, by)
+      nearby <- cand[d <= dist_thresh, , drop = FALSE]
+
+      if (nrow(nearby) == 0) next
+
+      nearby_saccade <- nearby %>% filter(segment_class == "saccade")
+
+      keep <- keep + 1
+      rows[[keep]] <- tibble(
+        scene_name = scene,
+        reasoning_trace = segs$reasoning_trace[i],
+
+        seg_start_x = ax, seg_start_y = ay,
+        seg_end_x   = bx, seg_end_y   = by,
+
+        n_within_1 = nrow(nearby),
+        mean_pupil = mean(nearby$pupil, na.rm = TRUE),
+
+        mean_gaze_speed_all =
+          mean(nearby$gaze_speed, na.rm = TRUE),
+
+        mean_gaze_speed_saccade =
+          mean(nearby_saccade$gaze_speed, na.rm = TRUE)
+      )
+    }
+
+    if (keep == 0) {
+      results_prop_list[[scene]] <- NULL
+      next
+    }
+
+    results_prop_list[[scene]] <- bind_rows(rows[seq_len(keep)])
+  }
+
+  results_prop_by_subject[[subject_id]] <- results_prop_list
+  message("Completed subject: ", subject_id, "\n")
+}
+
+```
+
+
+
+
+
+
+## Gaze speed
+
+Calculates each participant’s mean gaze speed during abstraction and simulation, then reports the within-subject difference.
+
+
+```{r}
+results_prop_by_subject_trimmed <- purrr::map(
+  results_prop_by_subject,
+  function(scene_list) {
+    purrr::map(
+      scene_list,
+      function(df) {
+        if (is.null(df) || nrow(df) == 0) return(df)
+
+        # only drop columns if they exist
+        dplyr::select(df, -dplyr::any_of(c("X1", "X2")))
+      }
+    )
+  }
+)
+
+gaze_speed_by_subject <- purrr::imap_dfr(
+  results_prop_by_subject_trimmed,
+  function(scene_list, participant_id) {
+
+    participant_df <- dplyr::bind_rows(scene_list)
+    if (nrow(participant_df) == 0) return(NULL)
+
+    filtered_df <- participant_df %>%
+      dplyr::filter(reasoning_trace %in% c("abstraction", "simulation"))
+
+    # skip subjects where the needed column is missing
+    if (!"mean_gaze_speed_all" %in% names(filtered_df)) return(NULL)
+
+    condition_summary <- filtered_df %>%
+      dplyr::group_by(reasoning_trace) %>%
+      dplyr::summarise(
+        mean_gaze_speed = mean(mean_gaze_speed_all, na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    if (!all(c("abstraction", "simulation") %in% condition_summary$reasoning_trace)) {
+      return(NULL)
+    }
+
+    abstraction_gaze <- condition_summary$mean_gaze_speed[
+      condition_summary$reasoning_trace == "abstraction"
+    ]
+    simulation_gaze <- condition_summary$mean_gaze_speed[
+      condition_summary$reasoning_trace == "simulation"
+    ]
+
+    tibble::tibble(
+      participant_id = participant_id,
+      abstraction = abstraction_gaze,
+      simulation = simulation_gaze,
+      gaze_speed_diff = simulation_gaze - abstraction_gaze
+    )
+  }
+)
+
+knitr::kable(gaze_speed_by_subject, digits = 3)
+```
+
+Runs a paired t-test comparing overall gaze speed between abstraction and simulation.
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+t_test_result <- t.test(
+  gaze_speed_by_subject$abstraction,
+  gaze_speed_by_subject$simulation,
+  paired = TRUE
+)
+
+t_test_result
+```
+
+
+
+
+
+
+## saccade speed
+
+
+Calculates each participant’s mean saccade-only gaze speed during abstraction and simulation.
+
+```{r}
+results_prop_by_subject_trimmed <- purrr::map(
+  results_prop_by_subject,
+  function(scene_list) {
+    purrr::map(
+      scene_list,
+      function(df) {
+        if (is.null(df) || nrow(df) == 0) return(df)
+
+        dplyr::select(df, -dplyr::any_of(c("X1", "X2")))
+      }
+    )
+  }
+)
+
+saccade_gaze_speed_by_subject <- purrr::imap_dfr(
+  results_prop_by_subject_trimmed,
+  function(scene_list, participant_id) {
+
+    participant_df <- dplyr::bind_rows(scene_list)
+    if (nrow(participant_df) == 0) return(NULL)
+
+    filtered_df <- participant_df %>%
+      dplyr::filter(reasoning_trace %in% c("abstraction", "simulation"))
+
+    if (!"mean_gaze_speed_saccade" %in% names(filtered_df)) return(NULL)
+
+    condition_summary <- filtered_df %>%
+      dplyr::group_by(reasoning_trace) %>%
+      dplyr::summarise(
+        mean_saccade_gaze_speed = mean(mean_gaze_speed_saccade, na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    if (!all(c("abstraction", "simulation") %in% condition_summary$reasoning_trace)) {
+      return(NULL)
+    }
+
+    abstraction_saccade_gaze <- condition_summary$mean_saccade_gaze_speed[
+      condition_summary$reasoning_trace == "abstraction"
+    ]
+    simulation_saccade_gaze <- condition_summary$mean_saccade_gaze_speed[
+      condition_summary$reasoning_trace == "simulation"
+    ]
+
+    tibble::tibble(
+      participant_id = participant_id,
+      abstraction = abstraction_saccade_gaze,
+      simulation = simulation_saccade_gaze,
+      saccade_gaze_speed_diff = simulation_saccade_gaze - abstraction_saccade_gaze
+    )
+  }
+)
+
+knitr::kable(saccade_gaze_speed_by_subject, digits = 3)
+```
+
+Runs a paired t-test comparing saccade speed between abstraction and simulation.
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+t_test_result <- t.test(
+  saccade_gaze_speed_by_subject$abstraction,
+  saccade_gaze_speed_by_subject$simulation,
+  paired = TRUE
+)
+
+t_test_result
+```
+
+Visualizes within-subject differences for overall gaze speed and saccade speed using violin plots with mean and standard-error markers.
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# Compute paired differences
+plot_df <- bind_rows(
+  gaze_speed_by_subject %>%
+    transmute(
+      measure = "gaze speed",
+      diff = abstraction - simulation
+    ),
+  saccade_gaze_speed_by_subject %>%
+    transmute(
+      measure = "saccade speed",
+      diff = abstraction - simulation
+    )
+)
+
+# Summary stats for optional overlays
+summary_df <- plot_df %>%
+  group_by(measure) %>%
+  summarise(
+    mean_diff = mean(diff, na.rm = TRUE),
+    se = sd(diff, na.rm = TRUE) / sqrt(sum(!is.na(diff))),
+    .groups = "drop"
+  )
+
+p <- ggplot(plot_df, aes(x = measure, y = diff, fill = measure)) +
+  geom_violin(trim = FALSE, alpha = 0.8, color = NA) +
+  geom_jitter(width = 0.08, size = 1.8, alpha = 0.5, color = "black") +
+  geom_point(
+    data = summary_df,
+    aes(x = measure, y = mean_diff),
+    inherit.aes = FALSE,
+    size = 2.5
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbar(
+    data = summary_df,
+    aes(
+      x = measure,
+      ymin = mean_diff - se,
+      ymax = mean_diff + se
+    ),
+    inherit.aes = FALSE,
+    width = 0.12,
+    size = 0.7
+  ) +
+  scale_fill_manual(values = c("#40BCD8", "coral")) +
+  labs(
+    x = NULL,
+    y = "within-subject difference\n(abstraction - simulation)"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x = element_text(size = 16),
+    legend.position = "none"
+  )
+
+p
+```
+
+
+
+
+
+
+
+# Pupil
+
+
+Calculates each participant’s mean log pupil size during abstraction and simulation, along with the simulation-minus-abstraction difference.
+
+```{r}
+results_prop_by_subject_clean <- purrr::map(
+  results_prop_by_subject,
+  function(scene_list) {
+    purrr::map(
+      scene_list,
+      function(df) {
+        if (is.null(df) || nrow(df) == 0) return(df)
+        df[, seq_len(ncol(df) - 2)]
+      }
+    )
+  }
+)
+
+pupil_wide <- purrr::imap_dfr(
+  results_prop_by_subject_clean,
+  function(scene_list, subject_id) {
+
+    subject_df <- dplyr::bind_rows(scene_list)
+    if (nrow(subject_df) == 0) return(NULL)
+
+    df <- subject_df %>%
+      dplyr::filter(reasoning_trace %in% c("abstraction", "simulation"))
+
+    trace_summary <- df %>%
+      dplyr::group_by(reasoning_trace) %>%
+      dplyr::summarise(
+        mean_mean_pupil = mean(mean_pupil, na.rm = TRUE),
+        n          = dplyr::n(),
+        sd_pupil   = ifelse(n > 1, sd(mean_pupil, na.rm = TRUE), 0),
+        .groups = "drop"
+      )
+
+    # must have both conditions
+    if (!all(c("abstraction", "simulation") %in% trace_summary$reasoning_trace)) {
+      return(NULL)
+    }
+
+    mean_abs <- trace_summary$mean_mean_pupil[
+      trace_summary$reasoning_trace == "abstraction"
+    ]
+    mean_sim <- trace_summary$mean_mean_pupil[
+      trace_summary$reasoning_trace == "simulation"
+    ]
+
+    sd_abs <- trace_summary$sd_pupil[
+      trace_summary$reasoning_trace == "abstraction"
+    ]
+    sd_sim <- trace_summary$sd_pupil[
+      trace_summary$reasoning_trace == "simulation"
+    ]
+
+    n_abs <- trace_summary$n[
+      trace_summary$reasoning_trace == "abstraction"
+    ]
+    n_sim <- trace_summary$n[
+      trace_summary$reasoning_trace == "simulation"
+    ]
+
+    se_diff <- sqrt((sd_sim^2 / n_sim) + (sd_abs^2 / n_abs))
+
+    tibble::tibble(
+      subject_id = subject_id,
+      abstraction = mean_abs,
+      simulation  = mean_sim,
+      pupil_diff       = mean_sim - mean_abs,
+      se_pupil_diff    = se_diff
+    )
+  }
+)
+
+knitr::kable(pupil_wide, digits = 3)
+```
+
+
+Runs a paired t-test testing whether pupil size differs between abstraction and simulation.
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+t_test_result <- t.test(
+  pupil_wide$abstraction,
+  pupil_wide$simulation,
+  paired = TRUE
+)
+
+t_test_result
+
+```
+
+
+
+Visualizes the within-subject pupil-size difference between simulation and abstraction using a violin plot with mean and standard-error markers.
+
+
+```{r, fig.height=4, fig.width=4}
+library(dplyr)
+library(ggplot2)
+
+# Compute paired differences
+plot_df <- pupil_wide %>%
+  transmute(
+    measure = "pupil size",
+    diff = simulation - abstraction
+  )
+
+# Summary stats for optional overlays
+summary_df <- plot_df %>%
+  group_by(measure) %>%
+  summarise(
+    mean_diff = mean(diff, na.rm = TRUE),
+    se = sd(diff, na.rm = TRUE) / sqrt(sum(!is.na(diff))),
+    .groups = "drop"
+  )
+
+p <- ggplot(plot_df, aes(x = measure, y = diff, fill = measure)) +
+  geom_violin(trim = FALSE, alpha = 0.8, color = NA) +
+  geom_jitter(width = 0.08, size = 1.8, alpha = 0.5, color = "black") +
+  geom_point(
+    data = summary_df,
+    aes(x = measure, y = mean_diff),
+    inherit.aes = FALSE,
+    size = 2.5
+  ) +
+  geom_errorbar(
+    data = summary_df,
+    aes(
+      x = measure,
+      ymin = mean_diff - se,
+      ymax = mean_diff + se
+    ),
+    inherit.aes = FALSE,
+    width = 0.12,
+    size = 0.7
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_fill_manual(values = c("pupil size" = "honeydew3")) +
+  labs(
+    x = NULL,
+    y = "within-subject difference\n(simulation - abstraction)"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x = element_text(size = 16),
+    legend.position = "none"
+  )
+
+p
+```
+
+
+
+
+
+
+
+
